@@ -1,0 +1,25 @@
+{
+  "deal_id": "demo_aapl_proxy_001",
+  "company_name": "DemoCo / Apple proxy",
+  "ticker": "AAPL",
+  "cik": "0000320193",
+  "mode": "pe_deal",
+  "entry_date": "2026-03-31",
+  "entry_revenue": 111184000000,
+  "entry_adjusted_ebitda": 143540000000,
+  "entry_ebitda_basis": "latest_quarter_ebitda_proxy_x4_demo_assumption",
+  "entry_ebitda_multiple": 18.0,
+  "entry_enterprise_value": 2583720000000,
+  "entry_net_debt": 37128000000,
+  "entry_equity_value": 2546592000000,
+  "sponsor_equity_contribution": 2546592000000,
+  "holding_period_years": 5.0,
+  "ic_target_irr": 0.19,
+  "ic_target_moic": 2.4,
+  "notes": [
+    "Synthetic demo metadata for PE-deal mode.",
+    "Uses Apple as public EDGAR data proxy, not as a realistic take-private target.",
+    "Entry adjusted EBITDA is approximated from latest quarterly EBITDA proxy multiplied by 4.",
+    "For production, replace with data room financials, QoE adjusted EBITDA, actual entry valuation, debt structure, and IC memo targets."
+  ]
+}
