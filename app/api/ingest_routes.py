@@ -28,8 +28,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.agents.kpi_extraction_agent import run_kpi_extraction_agent
+from app.analytics.sector import infer_sector_key
 from app.llm import azure_openai
 from app.schemas.kpi_schema import KPIExtractionConfig
+from app.store.company_store import update_company_meta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED = PROJECT_ROOT / "data" / "processed"
@@ -124,6 +126,17 @@ async def ingest_financials_upload(
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
     FEATURES.mkdir(parents=True, exist_ok=True)
+
+    # Sector is decided once, here at ingestion, and stored with the company so it
+    # survives a wipe of processed/ + features/ and benchmarking never has to guess.
+    sector_key = infer_sector_key(resolved_id, resolved_name)
+    update_company_meta(
+        resolved_id,
+        base_dir=str(PROCESSED),
+        company_name=resolved_name,
+        sector_key=sector_key,
+        source_type=source_type,
+    )
 
     # Adapters/loaders dispatch on suffix, so preserve it on the temp file.
     tmp_path: Optional[Path] = None
