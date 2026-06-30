@@ -12,6 +12,7 @@ export function PortfolioOverviewView({ data, onOpenCompany }: Props) {
   const red = data.severity_counts.Red || 0;
   const amber = data.severity_counts.Amber || 0;
   const onTrack = data.companies.filter((c) => c.health === "Green").length;
+  const attention = data.action_items.filter((a) => a.review_status !== "rejected");
 
   return (
     <div>
@@ -33,16 +34,16 @@ export function PortfolioOverviewView({ data, onOpenCompany }: Props) {
         <MetricCard label="Active Alerts" value={String(data.total_alerts ?? red + amber)} vs={`${red} critical · ${amber} watch`} icon="warning" iconColor="var(--red-text, #f87171)" delta={red > 0 ? `${red} critical` : undefined} />
       </div>
 
-      {/* Attention list */}
+      {/* Attention list — dismissed (rejected) alerts are gated out */}
       <SectionLabel>Needs Attention</SectionLabel>
-      {data.action_items.length === 0 ? (
+      {attention.length === 0 ? (
         <div className="card attention allclear allclear-banner" style={{ marginBottom: 26 }}>
           <span className="check">✓</span>
           <span style={{ fontSize: 13 }}>All companies on track — no value-creation drift detected this period.</span>
         </div>
       ) : (
         <div className="card attention" style={{ marginBottom: 26 }}>
-          {data.action_items.map((a, i) => (
+          {attention.map((a, i) => (
             <div key={a.company_id} className="card-pad"
               style={{ borderTop: i ? "1px solid var(--border)" : "none", display: "flex", gap: 14 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -50,6 +51,8 @@ export function PortfolioOverviewView({ data, onOpenCompany }: Props) {
                   <Badge status={a.priority === "P1" ? "Red" : "Amber"} label={a.priority} />
                   <button className="crumb" style={{ margin: 0, fontWeight: 600, color: "var(--text-primary)" }}
                     onClick={() => onOpenCompany(a.company_id)}>{a.company_name} ›</button>
+                  {(a.review_status === "approved" || a.review_status === "edited") &&
+                    <Badge status="Green" label="Reviewed ✓" />}
                 </div>
                 <p className="alert-headline" style={{ margin: "0 0 4px" }}>{a.headline}</p>
                 <p className="alert-rec"><b>Recommended:</b> {a.recommended_action}</p>

@@ -178,6 +178,25 @@ function IrrSection({ companyId }: { companyId: string }) {
     data.scenarios.map((s) => [`${s.exit_multiple}:${s.hold_years}`, s.irr_percent])
   );
 
+  // The quant forecast can yield non-positive exit EBITDA on short/volatile series,
+  // in which case no IRR is defined. Show the card with an explicit note rather than
+  // a blank grid, so the section is never silently missing.
+  if (data.scenarios.length === 0) {
+    return (
+      <div className="card section-gap card-pad">
+        <div className="chart-head">
+          <SectionLabel>IRR Scenario Analysis · Exit Multiple × Hold Year</SectionLabel>
+        </div>
+        <div className="card-hint" style={{ marginTop: 12 }}>
+          No IRR projection available — the EBITDA forecast for this company does not
+          produce a positive exit value over the modelled horizon, so IRR is undefined.
+          This resolves once the forecast horizon/seasonality is calibrated for the
+          monthly KPI series.
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="card section-gap card-pad">
       <div className="chart-head">
@@ -209,8 +228,56 @@ function IrrSection({ companyId }: { companyId: string }) {
         </tbody>
       </table>
       <div className="card-hint" style={{ marginTop: 10 }}>
-        Sensitivity matrix showing projected IRR across exit scenarios. Green ≥ 25% · Amber 15–25% · Red &lt; 15%.
+        Sensitivity on the quant engine's P50 EBITDA forecast at exit, over exit multiple × hold year.
+        Entry equity is fixed at deal close. Green ≥ 25% · Amber 15–25% · Red &lt; 15%.
       </div>
+      {data.summary && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${data.summary.ic_underwritten != null ? 4 : 3}, 1fr)`,
+            gap: 1,
+            marginTop: 16,
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            overflow: "hidden",
+            background: "var(--border)",
+          }}
+        >
+          {[
+            { label: "Bear (P10)", value: data.summary.bear_p10 as number | null },
+            { label: "Base (P50)", value: data.summary.base_p50 as number | null },
+            { label: "Bull (P90)", value: data.summary.bull_p90 as number | null },
+            // IC Underwritten only appears when sourced from the VCP store (never assumed).
+            ...(data.summary.ic_underwritten != null
+              ? [{
+                  label: "IC Underwritten",
+                  value: data.summary.ic_underwritten as number | null,
+                  gap: data.summary.gap_bps,
+                }]
+              : []),
+          ].map((c) => (
+            <div key={c.label} style={{ background: "var(--surface)", padding: "12px 14px" }}>
+              <div className="card-hint" style={{ marginBottom: 4 }}>{c.label}</div>
+              <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>
+                {c.value != null ? `${c.value.toFixed(1)}%` : "—"}
+              </div>
+              {"gap" in c && c.gap != null && (
+                <div
+                  className="mono"
+                  style={{
+                    fontSize: 12,
+                    marginTop: 2,
+                    color: c.gap >= 0 ? "rgba(34,197,94,0.95)" : "rgba(239,68,68,0.95)",
+                  }}
+                >
+                  {c.gap >= 0 ? "+" : ""}{c.gap}bps vs base
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

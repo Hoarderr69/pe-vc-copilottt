@@ -3,6 +3,11 @@ import { useEffect, useState } from "react";
 const API_BASE_URL =
   (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000";
 
+/** Absolute URL for a report export (pptx | pdf). Used as an anchor href. */
+export function reportExportUrl(reportId: string, format: "pptx" | "pdf"): string {
+  return `${API_BASE_URL}/api/reports/${reportId}/export/${format}`;
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE_URL}${path}`);
   if (!res.ok) {
@@ -45,7 +50,10 @@ export interface CompanyOverview {
   headline: string | null;
   recommended_action: string | null;
   primary_risks: string[];
+  review_status: ReviewStatus;
 }
+
+export type ReviewStatus = "none" | "pending" | "approved" | "edited" | "rejected";
 
 export interface ActionItem {
   company_id: string;
@@ -59,6 +67,9 @@ export interface ActionItem {
   recommended_action: string;
   primary_risks: string[];
   evidence: Evidence[];
+  review_status: ReviewStatus;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
 }
 
 export interface Evidence {
@@ -238,11 +249,20 @@ export interface IrrScenarioPoint {
   irr_percent: number;
 }
 
+export interface IrrScenarioSummary {
+  bear_p10: number;
+  base_p50: number;
+  bull_p90: number;
+  ic_underwritten: number | null;
+  gap_bps: number | null;
+}
+
 export interface IrrScenarioData {
   company_id: string;
   exit_multiples: number[];
   hold_years: number[];
   scenarios: IrrScenarioPoint[];
+  summary: IrrScenarioSummary | null;
 }
 
 async function postForm<T>(path: string, form: FormData): Promise<T> {

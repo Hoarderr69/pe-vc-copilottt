@@ -1,16 +1,15 @@
 import { useState } from "react";
-import type { ActionItem, HitlQueue, ReviewItem } from "../lib/api";
+import type { HitlQueue, ReviewItem } from "../lib/api";
 import { postDecision } from "../lib/api";
 import { Badge, SectionLabel } from "../components/ui";
 import { dateTime, metricLabel, statusClass } from "../lib/format";
 
 const REVIEWER = "operating.partner@firm.com";
 
-export function AlertsView({ data, actionItems, onChanged }: { data: HitlQueue; actionItems: ActionItem[]; onChanged: () => void }) {
+export function AlertsView({ data, onChanged }: { data: HitlQueue; onChanged: () => void }) {
   const items = data.queue_items ?? [];
   const pending = items.filter((i) => i.status === "pending_review");
   const reviewed = items.filter((i) => i.status !== "pending_review");
-  const hasAnything = items.length > 0 || actionItems.length > 0;
 
   return (
     <div>
@@ -18,7 +17,7 @@ export function AlertsView({ data, actionItems, onChanged }: { data: HitlQueue; 
         <h1 className="page-title">Alert Center</h1>
       </div>
 
-      {!hasAnything ? (
+      {items.length === 0 ? (
         <div className="center-state">
           <div style={{ textAlign: "center" }}>
             <span className="material-symbols-outlined" style={{ fontSize: 40, opacity: 0.3, display: "block", marginBottom: 12 }}>notifications_none</span>
@@ -28,56 +27,22 @@ export function AlertsView({ data, actionItems, onChanged }: { data: HitlQueue; 
         </div>
       ) : (
         <>
-          {actionItems.length > 0 && (
-            <>
-              <SectionLabel>Active Portfolio Alerts ({actionItems.length})</SectionLabel>
-              <div className="grid" style={{ marginBottom: 26 }}>
-                {actionItems.map((item) => <ActionAlertCard key={item.company_id} item={item} />)}
-              </div>
-            </>
-          )}
+          <SectionLabel>Needs Review ({pending.length})</SectionLabel>
+          <div className="grid" style={{ marginBottom: 26 }}>
+            {pending.length === 0 && <div className="card card-pad card-hint">Nothing pending — all alerts reviewed.</div>}
+            {pending.map((item) => <AlertCard key={item.review_id} item={item} onChanged={onChanged} />)}
+          </div>
 
-          {items.length > 0 && (
+          {reviewed.length > 0 && (
             <>
-              <SectionLabel>Pending HITL Review ({pending.length})</SectionLabel>
-              <div className="grid" style={{ marginBottom: 26 }}>
-                {pending.length === 0 && <div className="card card-pad card-hint">Nothing pending — all alerts reviewed.</div>}
-                {pending.map((item) => <AlertCard key={item.review_id} item={item} onChanged={onChanged} />)}
+              <SectionLabel>Reviewed ({reviewed.length})</SectionLabel>
+              <div className="grid">
+                {reviewed.map((item) => <AlertCard key={item.review_id} item={item} onChanged={onChanged} />)}
               </div>
-
-              {reviewed.length > 0 && (
-                <>
-                  <SectionLabel>Reviewed</SectionLabel>
-                  <div className="grid">
-                    {reviewed.map((item) => <AlertCard key={item.review_id} item={item} onChanged={onChanged} />)}
-                  </div>
-                </>
-              )}
             </>
           )}
         </>
       )}
-    </div>
-  );
-}
-
-function ActionAlertCard({ item }: { item: ActionItem }) {
-  const sev = item.priority === "P1" ? "Red" : "Amber";
-  return (
-    <div className={`card card-pad alert-card ${statusClass(sev)}`}>
-      <div className="alert-meta">
-        <Badge status={sev} label={item.priority} />
-        <strong style={{ color: "var(--text-primary)", fontSize: 13 }}>{item.company_name}</strong>
-        <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-muted)" }}>Rank #{item.priority_rank}</span>
-      </div>
-      <p className="alert-headline">{item.headline}</p>
-      <p className="alert-rec"><b>Action:</b> {item.recommended_action}</p>
-      <div className="risk-chips">
-        {item.primary_risks.map((r) => <span className="chip" key={r}>{metricLabel(r)}</span>)}
-      </div>
-      <div className="citation">
-        {item.red_alert_count} Red · {item.amber_alert_count} Amber · Score {item.priority_score}
-      </div>
     </div>
   );
 }

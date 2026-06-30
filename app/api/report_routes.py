@@ -15,6 +15,9 @@ Generation pipeline (per request):
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +31,7 @@ from app.analytics.peer_benchmarking import run_peer_benchmark_for_company
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.reports import slide_data_builder
 from app.reports.board_pack_generator import generate_board_pack
+from app.reports.pptx_generator import generate_pptx
 from app.reports.vcp_status_generator import generate_vcp_status_pdf
 from app.store.report_store import ReportRecord, ReportStore
 from app.store.vcp_store import VCPStore
@@ -49,6 +53,7 @@ _PROGRESS_LABEL = {s["key"]: s["label"] for s in PROGRESS_STEPS}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED = PROJECT_ROOT / "data" / "processed"
 HITL_AUDIT = PROCESSED / "hitl_audit_log.json"
+HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 _store = ReportStore()
@@ -206,6 +211,17 @@ def _build_risks_actions(
     return rows
 
 
+def _hitl_decision_for_company(company_id: str) -> Optional[Dict[str, Any]]:
+    """Return this company's current HITL queue decision, if any."""
+    queue = _load_json(HITL_QUEUE)
+    if not queue:
+        return None
+    for q in queue.get("queue_items", []):
+        if q.get("company_id") == company_id:
+            return q
+    return None
+
+
 def _load_hitl_decisions() -> List[Dict[str, Any]]:
     data = _load_json(HITL_AUDIT)
     if not data:
@@ -342,6 +358,15 @@ def generate_report(req: GenerateRequest) -> Dict[str, Any]:
         drift_scores=drift_results,
         kpi_snapshot=latest_kpi,
     )
+
+    # HITL gate: honor the operating-partner decision before the alert reaches the
+    # board pack. An edit overrides the AI's recommended lever with the human text;
+    # the rejection itself is already surfaced via the audit trail slide.
+    _hitl_item = _hitl_decision_for_company(company_id)
+    if _hitl_item and _hitl_item.get("status") == "approved_with_edit":
+        _edited = (_hitl_item.get("decision") or {}).get("edited_recommended_action")
+        if _edited:
+            alert_card.recommended_action = _edited
 
     # 5. Peer benchmarking (best-effort)
     peer_benchmark: Optional[Dict[str, Any]] = None
@@ -626,6 +651,102 @@ def download_pdf(report_id: str) -> Response:
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Export helpers (PPTX + PDF-from-PPTX)
+# ---------------------------------------------------------------------------
+
+def _export_filename(record: ReportRecord, ext: str) -> str:
+    """Spec §9 naming: [Company]_BoardPack_[Period]_[APPROVED_]?[Date].ext"""
+    type_label = "BoardPack" if record.report_type == "board_pack" else "VCPStatus"
+    date = (record.approved_at or record.generated_at or "")[:10] or datetime.now(
+        timezone.utc).date().isoformat()
+    parts = [record.company_name, type_label, record.period]
+    if record.status == "approved":
+        parts.append("APPROVED")
+    parts.append(date)
+    name = "_".join(p for p in parts if p)
+    return f"{name}.{ext}".replace(" ", "_").replace("/", "-")
+
+
+def _build_pptx_bytes(record: ReportRecord) -> bytes:
+    if not record.slides:
+        raise HTTPException(status_code=409,
+                            detail="Report has no slide payload — regenerate to enable export.")
+    return generate_pptx(
+        company_name=record.company_name,
+        period=record.period,
+        slides=record.slides,
+        is_approved=record.status == "approved",
+    )
+
+
+def _pptx_to_pdf(pptx_bytes: bytes) -> Optional[bytes]:
+    """Convert PPTX → PDF via headless LibreOffice. Returns None if unavailable."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "deck.pptx"
+        src.write_bytes(pptx_bytes)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmp, str(src)],
+                check=True, capture_output=True, timeout=120,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        out = Path(tmp) / "deck.pdf"
+        return out.read_bytes() if out.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/reports/{id}/export/pptx  —  editable PowerPoint deck
+# ---------------------------------------------------------------------------
+
+@router.get("/{report_id}/export/pptx")
+def export_pptx(report_id: str) -> Response:
+    record = _store.load(report_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+    pptx_bytes = _build_pptx_bytes(record)
+    return Response(
+        content=pptx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{_export_filename(record, "pptx")}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/reports/{id}/export/pdf  —  PDF rendered from the PPTX deck
+# ---------------------------------------------------------------------------
+
+@router.get("/{report_id}/export/pdf")
+def export_pdf(report_id: str) -> Response:
+    record = _store.load(report_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+
+    # Preferred path: render the editable deck to PDF via LibreOffice so the
+    # PPTX and PDF are pixel-identical.
+    pdf_bytes = _pptx_to_pdf(_build_pptx_bytes(record))
+
+    # Fallback: serve the pre-built reportlab board pack when LibreOffice is absent.
+    if pdf_bytes is None and _store.has_pdf(report_id):
+        pdf_bytes = _store.pdf_path(report_id).read_bytes()
+
+    if pdf_bytes is None:
+        raise HTTPException(
+            status_code=503,
+            detail="PDF export needs LibreOffice (soffice) on the server, or a pre-generated PDF.",
+        )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{_export_filename(record, "pdf")}"'},
     )
 
 

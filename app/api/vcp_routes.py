@@ -11,7 +11,6 @@ but the API never depends on their output files.
 from __future__ import annotations
 
 import json
-import math
 import re
 import tempfile
 from datetime import date
@@ -24,8 +23,10 @@ from pydantic import BaseModel
 from app.agents.vcp_extraction_agent import extract_from_document, to_vcp_milestones
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.llm import azure_openai
+from app.quant.vcp_irr import build_vcp_irr
 from app.store.vcp_store import VCPStore
 from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision
+from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
 from app.workflows.vcp_confirmation import (
     DEFAULT_STORE_PATH,
     VCPConfirmationError,
@@ -167,72 +168,6 @@ def _enrich_milestones(milestones: List[Dict], kpi_periods: List[str]) -> List[D
     return out
 
 
-# ── IRR (PE-style, derived from VCP milestones + KPI actuals) ────────────────
-
-def _pe_irr(entry_equity: float, exit_equity: float, years: float) -> Optional[float]:
-    if entry_equity <= 0 or exit_equity <= 0 or years <= 0:
-        return None
-    irr = ((exit_equity / entry_equity) ** (1.0 / years) - 1.0) * 100.0
-    return None if math.isnan(irr) or math.isinf(irr) else irr
-
-
-def _irr_matrix(company_id: str, kpi_records: List[Dict], milestones: List[Dict]) -> Dict[str, Any]:
-    """Build an exit_multiple × hold_years IRR grid from VCP targets + KPI entry metrics."""
-    if not kpi_records:
-        raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
-
-    entry = kpi_records[0]
-    entry_ebitda_m = entry.get("adjusted_ebitda") or entry.get("ebitda_proxy")
-    if not entry_ebitda_m:
-        raise HTTPException(status_code=422, detail="Entry EBITDA not available in KPI records.")
-    entry_ebitda = entry_ebitda_m * 12
-    entry_net_debt = entry.get("net_debt") or 0.0
-
-    ms = {m["metric"]: m for m in milestones}
-    rev_ms, margin_ms, lev_ms = ms.get("annual_revenue"), ms.get("ebitda_margin"), ms.get("net_debt_to_ebitda")
-
-    # Exit EBITDA from VCP targets; fall back to last KPI period
-    exit_ebitda: float
-    if rev_ms and rev_ms.get("target_value") and margin_ms and margin_ms.get("target_value"):
-        exit_ebitda = rev_ms["target_value"] * margin_ms["target_value"]
-    elif margin_ms and margin_ms.get("target_value") and kpi_records[-1].get("revenue"):
-        exit_ebitda = kpi_records[-1]["revenue"] * 12 * margin_ms["target_value"]
-    else:
-        exit_ebitda = entry_ebitda * 1.4  # assume 40 % growth if targets unavailable
-
-    # Exit net debt from VCP leverage target
-    if lev_ms and lev_ms.get("target_value") is not None:
-        exit_net_debt = lev_ms["target_value"] * exit_ebitda
-    else:
-        exit_net_debt = entry_net_debt * 0.5
-
-    # Entry equity: assume 10× entry multiple (typical PE mid-market)
-    entry_multiple = 10.0
-    entry_ev = entry_ebitda * entry_multiple
-    entry_equity = max(entry_ev - entry_net_debt, entry_ev * 0.3)
-
-    exit_multiples = [8.0, 10.0, 12.0, 14.0, 16.0]
-    hold_years = [3.0, 4.0, 5.0, 6.0]
-
-    rows = []
-    for em in exit_multiples:
-        for hy in hold_years:
-            exit_equity = em * exit_ebitda - exit_net_debt
-            irr = _pe_irr(entry_equity, exit_equity, hy)
-            if irr is not None:
-                rows.append({"exit_multiple": em, "hold_years": hy, "irr_percent": round(irr, 2)})
-
-    return {
-        "company_id": company_id,
-        "exit_multiples": exit_multiples,
-        "hold_years": hold_years,
-        "scenarios": rows,
-        "entry_ebitda_annual": round(entry_ebitda),
-        "exit_ebitda_estimate": round(exit_ebitda),
-        "entry_multiple_assumed": entry_multiple,
-    }
-
-
 # ── Action item scoring (inline — no pre-generated file needed) ───────────────
 
 _METRIC_WEIGHTS = {"net_debt_to_ebitda": 5, "ebitda_margin": 4, "annual_revenue": 3}
@@ -281,6 +216,18 @@ def _action_item(company_id: str, company_name: str, drift: Dict) -> Optional[Di
     else:
         headline = f"{company_name} is currently on track across evaluated VCP metrics."
 
+    # Cite the underlying Red/Amber drift results as evidence (metric + source).
+    evidence = [
+        {
+            "metric": r.get("metric"),
+            "severity": r.get("status"),
+            "summary": r.get("reason"),
+            "source_path": r.get("source_path"),
+            "source_column": r.get("source_column"),
+        }
+        for r in sorted(red + amber, key=lambda r: 0 if r.get("status") == "Red" else 1)
+    ]
+
     return {
         "company_id": company_id,
         "company_name": company_name,
@@ -292,7 +239,50 @@ def _action_item(company_id: str, company_name: str, drift: Dict) -> Optional[Di
         "primary_risks": metrics,
         "headline": headline,
         "recommended_action": action,
+        "evidence": evidence,
     }
+
+
+# ── HITL decision fold-back ──────────────────────────────────────────────────
+
+# Queue item status → the review_status surfaced on live alerts.
+_STATUS_TO_REVIEW = {
+    "pending_review": "pending",
+    "approved": "approved",
+    "approved_with_edit": "edited",
+    "rejected": "rejected",
+}
+
+
+def _hitl_decision_map() -> Dict[str, Dict[str, Any]]:
+    """Map company_id → its current HITL decision, read from the review queue."""
+    queue = _load_json(HITL_QUEUE, default={"queue_items": []})
+    out: Dict[str, Dict[str, Any]] = {}
+    for q in queue.get("queue_items", []):
+        cid = q.get("company_id")
+        if not cid:
+            continue
+        decision = q.get("decision", {})
+        out[cid] = {
+            "review_status": _STATUS_TO_REVIEW.get(q.get("status", ""), "pending"),
+            "review_id": q.get("review_id"),
+            "reviewed_by": decision.get("reviewed_by"),
+            "reviewed_at": decision.get("reviewed_at"),
+            "edited_recommended_action": decision.get("edited_recommended_action"),
+        }
+    return out
+
+
+def _apply_review_to_action_item(item: Dict[str, Any], decision: Optional[Dict[str, Any]]) -> None:
+    """Stamp an action item with its HITL review status; swap in edited action text."""
+    if not decision:
+        item["review_status"] = "none"
+        return
+    item["review_status"] = decision["review_status"]
+    item["reviewed_by"] = decision.get("reviewed_by")
+    item["reviewed_at"] = decision.get("reviewed_at")
+    if decision["review_status"] == "edited" and decision.get("edited_recommended_action"):
+        item["recommended_action"] = decision["edited_recommended_action"]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -378,8 +368,26 @@ def get_portfolio_overview() -> Dict[str, Any]:
 
     companies.sort(key=lambda x: (x["priority_rank"] is None, x["priority_rank"] or 0, x["company_name"]))
 
-    severity_counts: Dict[str, int] = {}
+    # Keep the HITL review queue in sync with the live monitoring run: new alerts
+    # become pending review items; existing items (and their decisions) are preserved.
+    try:
+        refresh_hitl_review_queue_from_action_items(action_items, output_path=str(HITL_QUEUE))
+    except Exception:
+        pass  # queue refresh is best-effort; never break the portfolio roll-up
+
+    # Fold HITL decisions back into the live view — the gate from the plan: an alert
+    # is only "board-ready" once a human approves it; a rejected alert is dismissed.
+    decisions = _hitl_decision_map()
     for item in action_items:
+        _apply_review_to_action_item(item, decisions.get(item["company_id"]))
+    for c in companies:
+        c["review_status"] = (decisions.get(c["company_id"]) or {}).get("review_status", "none")
+
+    # Escalation counts exclude dismissed (rejected) alerts.
+    severity_counts = {}
+    for item in action_items:
+        if item["review_status"] == "rejected":
+            continue
         for a in ["Red"] * item["red_alert_count"] + ["Amber"] * item["amber_alert_count"]:
             severity_counts[a] = severity_counts.get(a, 0) + 1
 
@@ -387,7 +395,7 @@ def get_portfolio_overview() -> Dict[str, Any]:
         "portfolio_company_count": len(companies),
         "total_alerts": sum(c["alert_count"] for c in companies),
         "severity_counts": severity_counts,
-        "action_item_count": len(action_items),
+        "action_item_count": sum(1 for i in action_items if i["review_status"] != "rejected"),
         "companies": companies,
         "action_items": action_items,
     }
@@ -453,12 +461,22 @@ def get_company_detail(company_id: str) -> Dict[str, Any]:
 
 @router.get("/company/{company_id}/irr")
 def get_irr_scenarios(company_id: str) -> Dict[str, Any]:
-    """PE IRR sensitivity matrix derived live from VCP targets and KPI entry metrics."""
-    store = VCPStore(DEFAULT_STORE_PATH)
-    milestones = [m.to_dict() for m in store.load_confirmed_for_company(company_id)]
-    if not milestones:
-        raise HTTPException(status_code=404, detail=f"No confirmed VCP for {company_id}.")
-    return _irr_matrix(company_id, _load_kpi(company_id), milestones)
+    """
+    IRR scenarios + sensitivity matrix.
+
+    Projections come from the quant forecast engine (P10/P50/P90 exit EBITDA);
+    entry equity and the IC-underwritten target come from the deal-metadata store.
+    VCP milestones are NOT used here — they are ground truth for drift, not projection.
+    """
+    kpi_records = _load_kpi(company_id)
+    if not kpi_records:
+        raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}.")
+    try:
+        return build_vcp_irr(company_id, kpi_records)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/company/{company_id}/peers")

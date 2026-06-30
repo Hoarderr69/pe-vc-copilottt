@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  getReport, approveReport, editReportSection, type ReportDetail,
+  getReport, approveReport, editReportSection, reportExportUrl, type ReportDetail,
 } from "../lib/api";
 import { Spinner } from "../components/ui";
 import { SlideRenderer } from "../components/slides/SlideRenderer";
@@ -17,6 +17,7 @@ export function ReportViewer({ reportId, onBack }: Props) {
   const [active, setActive] = useState(0);
   const [approving, setApproving] = useState(false);
   const [notes, setNotes] = useState<Record<number, string>>({});
+  const [exportOpen, setExportOpen] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -103,12 +104,38 @@ export function ReportViewer({ reportId, onBack }: Props) {
             {approving ? "Approving…" : "Approve & Finalise"}
           </button>
         )}
-        {report.has_pdf && (
-          <a href={`http://localhost:8000/api/reports/${report.id}/pdf`} target="_blank" rel="noreferrer"
-             className="btn" style={{ textDecoration: "none" }}>
-            ↓ Export PDF{!isApproved ? " (draft)" : ""}
-          </a>
-        )}
+        <div style={{ position: "relative" }}
+             onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setExportOpen(false); }}>
+          <button className="btn" onClick={() => setExportOpen(o => !o)}>
+            ↓ Export{!isApproved ? " (draft)" : ""} ▾
+          </button>
+          {exportOpen && (
+            <div style={{
+              position: "absolute", right: 0, top: "calc(100% + 4px)", zIndex: 20,
+              minWidth: 200, background: "var(--bg-surface)", border: "1px solid var(--border)",
+              borderRadius: 8, boxShadow: "var(--shadow-raised)", padding: 4,
+            }}>
+              <a href={reportExportUrl(report.id, "pptx")} target="_blank" rel="noreferrer"
+                 onClick={() => setExportOpen(false)}
+                 style={{ display: "block", padding: "8px 12px", borderRadius: 6, fontSize: 13,
+                          textDecoration: "none", color: "var(--text-primary)" }}>
+                PowerPoint (.pptx)
+                <span style={{ display: "block", fontSize: 11, color: "var(--text-muted)" }}>
+                  Editable deck{!isApproved ? " · DRAFT watermark" : ""}
+                </span>
+              </a>
+              <a href={reportExportUrl(report.id, "pdf")} target="_blank" rel="noreferrer"
+                 onClick={() => setExportOpen(false)}
+                 style={{ display: "block", padding: "8px 12px", borderRadius: 6, fontSize: 13,
+                          textDecoration: "none", color: "var(--text-primary)" }}>
+                PDF (.pdf)
+                <span style={{ display: "block", fontSize: 11, color: "var(--text-muted)" }}>
+                  Rendered from deck{!isApproved ? " · DRAFT watermark" : ""}
+                </span>
+              </a>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Slide navigator thumbnails */}

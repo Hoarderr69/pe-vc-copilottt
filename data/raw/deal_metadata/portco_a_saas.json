@@ -1,0 +1,17 @@
+{
+  "company_id": "portco_a_saas",
+  "company_name": "Portco A SaaS",
+  "deal_close_date": "2026-01-31",
+  "entry_ebitda": 4766568.0,
+  "entry_ev_multiple": 12.0,
+  "entry_enterprise_value": 57198816.0,
+  "entry_net_debt": 11970006.5,
+  "entry_equity_value": 45228809.5,
+  "holding_period_years": 5.0,
+  "fund_vintage": 2026,
+  "ic_target_irr": 0.25,
+  "ic_target_moic": 2.5,
+  "currency": "GBP",
+  "source_document": "portco_a_saas_ic_memo.md",
+  "notes": "Synthetic seed: entry economics derived from IC-memo Sources & Uses; entry EBITDA from first-12-month KPI actuals."
+}

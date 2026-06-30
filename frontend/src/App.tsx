@@ -202,7 +202,7 @@ export default function App() {
           {!loading && !error && portfolio && view !== "reports" && view !== "report-viewer" && (
             <>
               {view === "portfolio" && <PortfolioOverviewView data={portfolio} onOpenCompany={openCompany} />}
-              {view === "alerts" && hitl && <AlertsView data={hitl} actionItems={portfolio.action_items ?? []} onChanged={loadCore} />}
+              {view === "alerts" && hitl && <AlertsView data={hitl} onChanged={loadCore} />}
               {view === "memo" && <MemoView markdown={memo ?? ""} onGenerated={(md) => setMemo(md)} />}
               {view === "setup" && <SetupView companies={portfolio.companies} onVcpLocked={loadCore} onGoToIngest={() => setView("ingest")} />}
               {view === "ingest" && <IngestView companies={portfolio.companies} onOpenCompany={openCompany} onFinancialsIngested={loadCore} />}
