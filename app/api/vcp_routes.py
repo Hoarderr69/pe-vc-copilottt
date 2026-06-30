@@ -21,9 +21,11 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.agents.vcp_extraction_agent import extract_from_document, to_vcp_milestones
+from app.analytics.sector import infer_sector_key
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.llm import azure_openai
 from app.quant.vcp_irr import build_vcp_irr
+from app.store.company_store import load_company_meta, update_company_meta
 from app.store.vcp_store import VCPStore
 from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision
 from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
@@ -39,7 +41,6 @@ IC_MEMO_DIR = PROJECT_ROOT / "data" / "raw" / "ic_memos"
 HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 HITL_AUDIT = PROCESSED / "hitl_audit_log.json"
 PORTFOLIO_MEMO = PROCESSED / "portfolio_memo.md"
-SECTOR_BENCHMARKS = PROJECT_ROOT / "data" / "reference" / "sector_benchmarks.json"
 
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -88,36 +89,17 @@ def _clean_name(stem: str) -> str:
     return " ".join(w.capitalize() for w in re.split(r"[_\-\s]+", cleaned) if w)
 
 
-def _infer_sector(company_id: str, company_name: str) -> Optional[str]:
-    """Return sector key from sector_benchmarks.json, auto-inferring from name if not mapped."""
-    if not SECTOR_BENCHMARKS.exists():
-        return None
-    benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
-    sector_map = benchmarks.get("company_sector_map", {})
+def _resolve_company_sector(company_id: str, company_name: str) -> Optional[str]:
+    """Sector for a company: stored meta first, else inferred from id/name.
 
-    # Exact match first
-    if company_id in sector_map:
-        return sector_map[company_id]
-
-    # Keyword inference from company name/id
-    text = (company_id + " " + company_name).lower()
-    if any(k in text for k in ("saas", "software", "tech")):
-        return "b2b_saas"
-    if any(k in text for k in ("industrial", "manufacturing", "factory")):
-        return "industrial_manufacturing"
-    if any(k in text for k in ("health", "care", "medical", "pharma")):
-        return "healthcare_services"
-    return None
-
-
-def _register_sector(company_id: str, sector_key: str) -> None:
-    """Persist a new company→sector mapping so future lookups are instant."""
-    if not SECTOR_BENCHMARKS.exists():
-        return
-    benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
-    if company_id not in benchmarks.get("company_sector_map", {}):
-        benchmarks.setdefault("company_sector_map", {})[company_id] = sector_key
-        SECTOR_BENCHMARKS.write_text(json.dumps(benchmarks, indent=2), encoding="utf-8")
+    Sector is a first-class company attribute (set at ingestion), so we read it from
+    the company's meta sidecar before falling back to inference. The shared resolver
+    in app.analytics.sector holds the actual inference logic.
+    """
+    meta = load_company_meta(company_id, base_dir=str(PROCESSED))
+    if meta and meta.sector_key:
+        return meta.sector_key
+    return infer_sector_key(company_id, company_name)
 
 
 # ── Plan-path generation ─────────────────────────────────────────────────────
@@ -488,16 +470,21 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
     if not kpi_path.exists():
         raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
 
-    # Auto-register sector mapping if not already present
+    # Resolve the company's sector from its stored meta (or infer + persist it), then
+    # pass it down. We never mutate the shared benchmark reference file.
     store = VCPStore(DEFAULT_STORE_PATH)
     confirmed = store.load_confirmed_for_company(company_id)
     name = confirmed[0].company_name if confirmed else company_id
-    sector = _infer_sector(company_id, name)
+    sector = _resolve_company_sector(company_id, name)
     if sector:
-        _register_sector(company_id, sector)
+        update_company_meta(
+            company_id, base_dir=str(PROCESSED), company_name=name, sector_key=sector
+        )
 
     try:
-        return run_peer_benchmark_for_company(company_id=company_id, kpi_records_path=str(kpi_path))
+        return run_peer_benchmark_for_company(
+            company_id=company_id, kpi_records_path=str(kpi_path), sector_key=sector
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -599,6 +586,15 @@ async def run_extraction_from_upload(
 
     resolved_name = (company_name or "").strip() or _clean_name(Path(filename).stem)
     resolved_id = (company_id or "").strip() or _slugify(resolved_name)
+
+    # Decide the company's sector once, here at ingestion, and store it with the company.
+    update_company_meta(
+        resolved_id,
+        base_dir=str(PROCESSED),
+        company_name=resolved_name,
+        sector_key=infer_sector_key(resolved_id, resolved_name),
+        source_type="ic_memo",
+    )
 
     tmp_path: Optional[Path] = None
     try:
