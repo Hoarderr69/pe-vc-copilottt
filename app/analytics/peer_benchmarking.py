@@ -241,15 +241,15 @@ def run_peer_benchmark_for_company(
     output_path: Optional[str] = None,
     sector_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Benchmark one company's latest metrics against its sector medians."""
-    benchmarks = _load_benchmarks(benchmarks_path)
-    sector_key = benchmarks.get("company_sector_map", {}).get(company_id)
-    if sector_key is None:
-        raise ValueError(f"No sector mapping for company '{company_id}' in {benchmarks_path}")
+    """Benchmark one company's latest metrics against its sector medians.
 
-    sector = benchmarks["sectors"][sector_key]
-    directions = benchmarks["_metric_direction"]
-    medians = sector["medians"]
+    ``sector_key`` resolution: explicit arg → company meta / deal store → legacy
+    ``company_sector_map`` in the reference file. When the sector still can't be
+    resolved (or has no medians), this returns a Not-Evaluable payload with a clear
+    reason rather than raising — benchmarking never hard-fails the surrounding report.
+    """
+    benchmarks = _load_benchmarks(benchmarks_path)
+    directions = benchmarks.get("_metric_direction") or _DEFAULT_METRIC_DIRECTION
 
     path = Path(kpi_records_path)
     if not path.exists():
