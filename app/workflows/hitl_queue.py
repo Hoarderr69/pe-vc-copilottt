@@ -1,9 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON via a temp file + rename so concurrent readers never see a
+    truncated/empty file (multiple browser tabs can poll the same endpoint
+    and trigger overlapping refreshes of this file)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, default=str))
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def default_review_action(priority: str) -> str:
@@ -59,8 +76,9 @@ def refresh_hitl_review_queue_from_action_items(
     path = Path(output_path)
     now = datetime.now(timezone.utc).isoformat()
 
-    if path.exists():
-        queue = json.loads(path.read_text(encoding="utf-8"))
+    existing_text = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    if existing_text:
+        queue = json.loads(existing_text)
         items: List[Dict[str, Any]] = queue.get("queue_items", [])
     else:
         queue = {"created_at": now}
@@ -81,8 +99,7 @@ def refresh_hitl_review_queue_from_action_items(
     )
     queue["refreshed_at"] = now
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(queue, indent=2, default=str), encoding="utf-8")
+    _atomic_write_json(path, queue)
 
     return queue
 

@@ -26,6 +26,13 @@ class ForecastConfig:
 
 MACRO_COLS = ["fed_funds_rate", "cpi", "credit_spread"]
 
+# Seasonal models need multiple full cycles to estimate seasonal indices reliably.
+# Below this many observations, seasonal terms are estimated on noise rather than
+# signal and tend to extrapolate explosively over a 20-period horizon — fall back
+# to non-seasonal fits instead. Rule of thumb: 3 full seasonal cycles.
+def _min_obs_for_seasonal(seasonal_periods: int) -> int:
+    return 3 * seasonal_periods
+
 
 def _ensure_output_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -43,6 +50,22 @@ def load_model_features(config: ForecastConfig) -> pd.DataFrame:
     df = pd.read_csv(path)
     df[config.date_col] = pd.to_datetime(df[config.date_col])
     df = df.sort_values(config.date_col).reset_index(drop=True)
+
+    if len(df) >= 2:
+        median_days = df[config.date_col].diff().dropna().dt.days.median()
+        # This pipeline fits quarterly-seasonal models (seasonal_periods=4) and steps
+        # future dates at freq="QE". A feature matrix spaced like monthly data would
+        # silently mislabel monthly EBITDA as quarterly, understating annualized
+        # terminal EBITDA ~3-4x downstream in vcp_irr.py. Ingestion adapters are
+        # responsible for resampling to quarterly (see app/ingestion/quarterly_resample.py)
+        # before writing a model feature matrix — fail loudly if one slipped through.
+        if median_days <= 45:
+            raise ValueError(
+                f"Model feature matrix {path} looks monthly (median {median_days:.0f} "
+                "days between periods), but the quant forecast engine assumes quarterly "
+                "rows. Resample to quarterly at ingestion (see "
+                "app.ingestion.quarterly_resample.resample_to_quarterly) before forecasting."
+            )
 
     if config.target_col not in df.columns:
         raise ValueError(f"Missing target column: {config.target_col}")
@@ -129,10 +152,18 @@ def forecast_holt_winters(
     series = df.set_index(config.date_col)[config.target_col]
     future_dates = make_future_dates(series.index.max(), config.periods)
 
+    # Damped trend prevents unbounded linear extrapolation over a 20-period horizon
+    # when fit on a short history — without it, any short-history slope (e.g. a
+    # one-time step-change from plan to drift) gets extended indefinitely.
+    has_enough_for_seasonal = len(series) >= _min_obs_for_seasonal(config.seasonal_periods)
+
     try:
+        if not has_enough_for_seasonal:
+            raise ValueError("Insufficient history for seasonal fit")
         model = ExponentialSmoothing(
             series,
             trend="add",
+            damped_trend=True,
             seasonal="add",
             seasonal_periods=config.seasonal_periods,
             initialization_method="estimated",
@@ -142,6 +173,7 @@ def forecast_holt_winters(
         model = ExponentialSmoothing(
             series,
             trend="add",
+            damped_trend=True,
             seasonal=None,
             initialization_method="estimated",
         )
@@ -172,10 +204,17 @@ def forecast_sarima(
     series = df.set_index(config.date_col)[config.target_col]
     future_dates = make_future_dates(series.index.max(), config.periods)
 
+    # Seasonal differencing (D=1) on a short series leaves almost no residual
+    # degrees of freedom to estimate AR/MA terms, producing unstable coefficients
+    # that diverge over a long forecast horizon. Drop the seasonal component when
+    # there isn't enough history to estimate it reliably.
+    has_enough_for_seasonal = len(series) >= _min_obs_for_seasonal(config.seasonal_periods)
+    seasonal_order = (1, 1, 1, config.seasonal_periods) if has_enough_for_seasonal else (0, 0, 0, 0)
+
     model = SARIMAX(
         series,
         order=(1, 1, 1),
-        seasonal_order=(1, 1, 1, config.seasonal_periods),
+        seasonal_order=seasonal_order,
         enforce_stationarity=False,
         enforce_invertibility=False,
     )
@@ -223,11 +262,14 @@ def forecast_sarimax(
         index=future_dates,
     )
 
+    has_enough_for_seasonal = len(series) >= _min_obs_for_seasonal(config.seasonal_periods)
+    seasonal_order = (1, 1, 1, config.seasonal_periods) if has_enough_for_seasonal else (0, 0, 0, 0)
+
     model = SARIMAX(
         series,
         exog=exog,
         order=(1, 1, 1),
-        seasonal_order=(1, 1, 1, config.seasonal_periods),
+        seasonal_order=seasonal_order,
         enforce_stationarity=False,
         enforce_invertibility=False,
     )
@@ -281,11 +323,17 @@ def forecast_prophet(
     for col in macro_cols:
         prophet_df[col] = df[col].values
 
+    # Yearly seasonality needs >=2 full cycles to estimate reliably, and the default
+    # changepoint flexibility (0.05) lets the trend chase a single short-history
+    # regime-shift (e.g. plan -> drift) and extrapolate that slope indefinitely over
+    # a 20-period horizon. Tighten both when history is short relative to the horizon.
+    has_enough_for_seasonal = len(df) >= _min_obs_for_seasonal(config.seasonal_periods)
     model = Prophet(
         interval_width=0.80,
-        yearly_seasonality=True,
+        yearly_seasonality=has_enough_for_seasonal,
         weekly_seasonality=False,
         daily_seasonality=False,
+        changepoint_prior_scale=0.05 if has_enough_for_seasonal else 0.01,
     )
 
     for col in macro_cols:
@@ -382,6 +430,14 @@ def build_ensemble(forecasts: List[pd.DataFrame], periods: int = 20) -> pd.DataF
     # Keep exactly requested forecast horizon.
     ensemble = ensemble.head(periods)
 
+    # Backstop floor: negative recurring EBITDA isn't a meaningful quarterly forecast
+    # for this terminal-value calculation. On short histories (see _min_obs_for_seasonal),
+    # individual models can still extrapolate a short-history step-change into negative
+    # territory even with seasonal terms and damped trend disabled/dampened — clip rather
+    # than let a doomed forecast propagate into an undefined or wildly negative IRR.
+    for col in ("p10", "p50", "p90"):
+        ensemble[col] = ensemble[col].clip(lower=0.0)
+
     ensemble["model"] = "ensemble"
     ensemble["target_metric"] = "ebitda_proxy"
 
@@ -396,6 +452,44 @@ def build_ensemble(forecasts: List[pd.DataFrame], periods: int = 20) -> pd.DataF
             "model_count",
         ]
     ]
+
+
+def apply_minimum_uncertainty(
+    forecast_df: pd.DataFrame,
+    history: pd.Series,
+    min_cv: float = 0.15,
+) -> pd.DataFrame:
+    """
+    Prevent overconfident P10-P90 bands on short-history forecasts.
+
+    Non-seasonal ARIMA on 8 points often produces very tight confidence
+    intervals because it has almost no residual variance to estimate — the
+    interval reflects in-sample fit quality, not genuine long-horizon
+    uncertainty. This enforces a minimum spread based on the actual
+    coefficient of variation observed in the historical series, widening
+    with horizon so uncertainty grows as it should over a 5-year projection.
+
+    min_cv: minimum coefficient of variation (spread / |central|). 0.15
+    means the half-spread is at least 15% of |p50| at period 1, growing
+    by 10pp per forward period.
+    """
+    if history.empty or history.mean() == 0:
+        return forecast_df
+
+    hist_cv = history.std() / abs(history.mean())
+    effective_cv = max(hist_cv, min_cv)
+
+    result = forecast_df.copy()
+    result = result.reset_index(drop=True)
+
+    for i, row in result.iterrows():
+        half_spread = abs(row["p50"]) * effective_cv * (1 + 0.10 * i)
+        current_half = (row["p90"] - row["p10"]) / 2.0
+        if current_half < half_spread:
+            result.at[i, "p10"] = max(0.0, row["p50"] - half_spread)
+            result.at[i, "p90"] = row["p50"] + half_spread
+
+    return result
 
 def run_quant_forecast(config: ForecastConfig | None = None) -> pd.DataFrame:
     if config is None:
@@ -435,7 +529,11 @@ def run_quant_forecast(config: ForecastConfig | None = None) -> pd.DataFrame:
         print("[Quant] Prophet forecast complete")
         forecasts.append(prophet)
 
-        ensemble = build_ensemble(forecasts, periods=config.periods)
+    ensemble = build_ensemble(forecasts, periods=config.periods)
+
+    history_series = df.set_index(config.date_col)[config.target_col]
+    ensemble = apply_minimum_uncertainty(ensemble, history_series)
+    print("[Quant] Minimum uncertainty floor applied")
 
     _ensure_output_dir(config.output_path)
     ensemble.to_csv(config.output_path, index=False)

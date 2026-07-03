@@ -51,6 +51,8 @@ export interface CompanyOverview {
   recommended_action: string | null;
   primary_risks: string[];
   review_status: ReviewStatus;
+  data_source?: string | null;
+  currency?: string;
 }
 
 export type ReviewStatus = "none" | "pending" | "approved" | "edited" | "rejected";
@@ -100,7 +102,8 @@ export interface Milestone {
   target_value: number | null;
   target_date: string | null;
   confidence: number;
-  metadata?: { plan_path?: PlanPoint[] };
+  source_document?: string | null;
+  metadata?: { plan_path?: PlanPoint[]; extraction_mode?: string };
 }
 
 export interface DriftResult {
@@ -127,7 +130,11 @@ export interface KpiPoint {
 export interface CompanyDetail {
   company_id: string;
   company_name: string;
+  sector: string | null;
+  data_source: string | null;
+  cik: string | null;
   currency: string;
+  periods_per_year?: number;
   health: Status;
   status_counts: Record<string, number>;
   latest_period_end: string;
@@ -257,12 +264,24 @@ export interface IrrScenarioSummary {
   gap_bps: number | null;
 }
 
+export interface IrrEquityAtRiskDetail {
+  base_exit_equity: number;
+  entry_net_debt: number;
+  terminal_ebitda_base: number;
+  nd_ebitda_trailing: number | null;
+}
+
 export interface IrrScenarioData {
   company_id: string;
+  currency: string;
   exit_multiples: number[];
   hold_years: number[];
   scenarios: IrrScenarioPoint[];
   summary: IrrScenarioSummary | null;
+  basis_mismatch?: boolean;
+  basis_warning?: string | null;
+  equity_at_risk: boolean;
+  equity_at_risk_detail: IrrEquityAtRiskDetail | null;
 }
 
 async function postForm<T>(path: string, form: FormData): Promise<T> {
@@ -324,6 +343,42 @@ export interface IngestResult {
   kpi_records_path: string;
   periods: IngestedPeriod[];
 }
+
+/* ---------- Company onboarding (deal metadata + EDGAR pull) ---------- */
+
+export interface SeedCompanyRequest {
+  company_id: string;
+  company_name: string;
+  cik?: string;
+  ticker?: string;
+  sector_key?: string;
+  deal_close_date?: string;
+  entry_ebitda?: number | null;
+  entry_ev_multiple?: number | null;
+  entry_enterprise_value?: number | null;
+  entry_net_debt?: number | null;
+  entry_equity_value?: number | null;
+  holding_period_years?: number | null;
+  fund_vintage?: number | null;
+  ic_target_irr?: number | null;
+  ic_target_moic?: number | null;
+  currency?: string;
+  source_document?: string;
+  notes?: string;
+}
+
+export interface SeedCompanyResult {
+  company_id: string;
+  company_name: string;
+  deal_metadata_saved: boolean;
+  edgar_ingested: boolean;
+  kpi_periods: number;
+  source_quality_status?: string | null;
+  errors: string[];
+}
+
+export const seedCompany = (payload: SeedCompanyRequest) =>
+  post<SeedCompanyResult>("/api/vcp/companies", payload);
 
 export const getIngestStatus = () => get<IngestStatus>("/api/ingest/status");
 

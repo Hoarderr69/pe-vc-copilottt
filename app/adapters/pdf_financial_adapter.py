@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from app.adapters.base import BaseKPIAdapter
 from app.ingestion.document_loader import load_document_text
 from app.ingestion.financial_normalization import normalize_periods
+from app.ingestion.quarterly_resample import resample_to_quarterly
 from app.llm import azure_openai
 from app.schemas.kpi_schema import (
     EvidenceRef,
@@ -546,7 +547,18 @@ class PdfFinancialAdapter(BaseKPIAdapter):
                       "adjusted_ebitda", "ebitda_proxy", "working_capital", "cash",
                       "net_debt", "free_cash_flow"]
         model_cols = [c for c in model_cols if c in df.columns]
-        (df[model_cols] if model_cols else df).to_csv(config.model_feature_matrix_path, index=False)
+        model_df = df[model_cols] if model_cols else df
+        # See app/adapters/private_portco_adapter.py for why: forecast_engine.py
+        # assumes quarterly rows, but PDF-extracted financials default to
+        # period_type="month". Resample the model matrix only; raw stays native cadence.
+        model_df, was_resampled = resample_to_quarterly(model_df, date_col="period_end")
+        if was_resampled:
+            print(
+                f"[PdfFinancialAdapter] Resampled model feature matrix to quarterly "
+                f"cadence ({len(df)} rows -> {len(model_df)} quarterly rows) for "
+                f"{config.company_id}"
+            )
+        model_df.to_csv(config.model_feature_matrix_path, index=False)
 
     def _quality_report(self, config, rows, kpi_records, mode, model, units_note, loader, norm_report=None) -> Dict[str, Any]:
         present_fields = {k for r in rows for k, v in r.items() if v is not None}

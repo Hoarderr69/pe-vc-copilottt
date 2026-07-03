@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from app.adapters.base import BaseKPIAdapter
+from app.ingestion.quarterly_resample import resample_to_quarterly
 from app.schemas.kpi_schema import (
     EvidenceRef,
     KPIExtractionConfig,
@@ -79,7 +80,17 @@ class ExcelQPRAdapter(BaseKPIAdapter):
             parents=True,
             exist_ok=True,
         )
-        df.to_csv(config.model_feature_matrix_path, index=False)
+        # forecast_engine.py assumes quarterly rows. QPR exports are normally already
+        # quarterly, so this is a no-op safety net rather than the primary fix path
+        # (see app/adapters/private_portco_adapter.py for the monthly case).
+        model_df, was_resampled = resample_to_quarterly(df, date_col="period_end")
+        if was_resampled:
+            print(
+                f"[ExcelQPRAdapter] Resampled model feature matrix to quarterly "
+                f"cadence ({len(df)} rows -> {len(model_df)} quarterly rows) for "
+                f"{config.company_id}"
+            )
+        model_df.to_csv(config.model_feature_matrix_path, index=False)
 
         evidence_refs: List[Dict[str, Any]] = []
         kpi_records: List[Dict[str, Any]] = []

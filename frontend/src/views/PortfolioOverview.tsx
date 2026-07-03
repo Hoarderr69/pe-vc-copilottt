@@ -98,11 +98,14 @@ function PortfolioCard({ c, onOpen }: { c: CompanyOverview; onOpen: () => void }
           }} />
           <div className="co-name">{c.company_name}</div>
         </div>
-        <Badge status={c.health} />
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          {c.data_source === "edgar" && <DataSourceBadge />}
+          <Badge status={c.health} />
+        </div>
       </div>
       {/* Body */}
       <div className="card-pad" style={{ flex: 1 }}>
-        <KpiLine label="Revenue (run-rate)" value={money(rev?.actual)} delta={rev?.gap_pct != null ? signedPct(rev.gap_pct) : ""} down={(rev?.gap_pct ?? 0) < 0} />
+        <KpiLine label="Revenue (run-rate)" value={money(rev?.actual, c.currency)} delta={rev?.gap_pct != null ? signedPct(rev.gap_pct) : ""} down={(rev?.gap_pct ?? 0) < 0} />
         <KpiLine label="EBITDA Margin" value={pct(marg?.actual)} delta={bpsAbs(marg?.actual, marg?.target)} down={(marg?.actual ?? 0) < (marg?.target ?? 0)} />
         <div className="co-kpi">
           <span className="k">VCP on track</span>
@@ -117,6 +120,17 @@ function PortfolioCard({ c, onOpen }: { c: CompanyOverview; onOpen: () => void }
         </div>
       )}
     </div>
+  );
+}
+
+function DataSourceBadge() {
+  return (
+    <span title="Live EDGAR data — sourced directly from SEC public filings" style={{
+      fontSize: 10, fontWeight: 700, letterSpacing: "0.04em",
+      padding: "2px 6px", borderRadius: 4,
+      background: "rgba(59,130,246,0.15)", color: "var(--blue-text, #60a5fa)",
+      border: "1px solid rgba(59,130,246,0.3)", whiteSpace: "nowrap",
+    }}>EDGAR</span>
   );
 }
 

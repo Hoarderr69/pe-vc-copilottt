@@ -2,7 +2,7 @@ import type { Status } from "./api";
 
 export function money(v: number | null | undefined, currency = "GBP"): string {
   if (v == null || isNaN(v)) return "—";
-  const sym = currency === "GBP" ? "£" : currency === "USD" ? "$" : "";
+  const sym = currency === "GBP" ? "£" : currency === "USD" ? "$" : currency === "EUR" ? "€" : "";
   const abs = Math.abs(v);
   if (abs >= 1e9) return `${sym}${(v / 1e9).toFixed(2)}B`;
   if (abs >= 1e6) return `${sym}${(v / 1e6).toFixed(1)}M`;

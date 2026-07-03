@@ -29,6 +29,8 @@ from pydantic import BaseModel
 from app.agents import alert_synthesis_agent, report_narrative_agent
 from app.analytics.peer_benchmarking import run_peer_benchmark_for_company
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
+from app.store.deal_store import DealStore
+from app.quant.vcp_irr import build_vcp_irr
 from app.reports import slide_data_builder
 from app.reports.board_pack_generator import generate_board_pack
 from app.reports.pptx_generator import generate_pptx
@@ -232,11 +234,29 @@ def _load_hitl_decisions() -> List[Dict[str, Any]]:
 def _build_citations(
     company_id: str,
     peer_benchmark: Optional[Dict[str, Any]],
+    kpi_records: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     cits = [
-        f"VCP Milestones: data/processed/synthetic_vcp_milestones_seed.json",
+        f"VCP Milestones: data/processed/vcp_store.json",
         f"KPI Records: data/processed/{company_id}_kpi_records.json",
     ]
+
+    # For EDGAR-sourced companies, add the SEC filing URL as a verifiable citation.
+    if kpi_records:
+        first = kpi_records[0]
+        if first.get("source_type") == "edgar":
+            cik_raw = first.get("cik", "").strip()
+            if cik_raw and cik_raw not in ("N/A", ""):
+                cik_pad = cik_raw.zfill(10)
+                cits.append(
+                    f"Primary source: SEC EDGAR companyfacts API — "
+                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_pad}.json"
+                )
+                cits.append(
+                    f"SEC filings index — "
+                    f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_pad}&type=10-K&dateb=&owner=include&count=10"
+                )
+
     if peer_benchmark:
         n = peer_benchmark.get("peer_set_size", "?")
         sector = peer_benchmark.get("sector_label", "sector")
@@ -368,12 +388,16 @@ def generate_report(req: GenerateRequest) -> Dict[str, Any]:
         if _edited:
             alert_card.recommended_action = _edited
 
-    # 5. Peer benchmarking (best-effort)
+    # 5. Peer benchmarking (best-effort) — resolve sector_key from deal metadata so
+    # any take-private with a DealMetadata.sector_key benchmarks without code changes.
     peer_benchmark: Optional[Dict[str, Any]] = None
     try:
+        _deal = DealStore().load(company_id)
+        _sector_key = _deal.sector_key if _deal else None
         peer_benchmark = run_peer_benchmark_for_company(
             company_id=company_id,
             kpi_records_path=str(kpi_path),
+            sector_key=_sector_key,
         )
     except Exception:
         peer_benchmark = None
@@ -411,19 +435,21 @@ def generate_report(req: GenerateRequest) -> Dict[str, Any]:
     # 7. Build structured data for in-app viewer + PDF
     kpi_performance = _build_kpi_performance(drift_results, kpi_series)
     risks_actions   = _build_risks_actions(alert_card, drift_results)
-    citations       = _build_citations(company_id, peer_benchmark)
+    citations       = _build_citations(company_id, peer_benchmark, kpi_records=kpi_records_raw)
     hitl_decisions  = _load_hitl_decisions()
 
-    # 8. IRR scenarios (best-effort from pre-computed file)
-    irr_scenarios: Optional[List[Dict[str, Any]]] = None
-    irr_path = PROCESSED / "irr_scenarios.csv"
-    if irr_path.exists():
-        try:
-            import pandas as pd
-            df = pd.read_csv(irr_path)
-            irr_scenarios = df.to_dict(orient="records")
-        except Exception:
-            pass
+    # 8. IRR scenarios — live from the quant forecast engine (best-effort; requires
+    # deal metadata + a model feature matrix for the company, same data the
+    # company-deep-dive page's /api/vcp/company/{id}/irr endpoint already uses).
+    irr_data: Optional[Dict[str, Any]] = None
+    try:
+        irr_data = build_vcp_irr(company_id, kpi_records_raw)
+    except Exception:
+        irr_data = None
+    # Legacy list-of-scenario-dict shape, kept for the reportlab PDF + ReportRecord.
+    irr_scenarios: Optional[List[Dict[str, Any]]] = (
+        irr_data["scenario_detail"] if irr_data else None
+    )
 
     sector = kpi_records_raw[0].get("source_type", "") if kpi_records_raw else ""
 
@@ -441,7 +467,7 @@ def generate_report(req: GenerateRequest) -> Dict[str, Any]:
         alert_card=alert_card.model_dump(),
         narrative=narrative.model_dump(),
         peer_benchmark=peer_benchmark,
-        irr_scenarios=irr_scenarios,
+        irr_data=irr_data,
         board_questions=board_questions,
         risks_output=risks_output.model_dump(),
         citations=citations,

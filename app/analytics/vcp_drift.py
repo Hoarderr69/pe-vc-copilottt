@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from app.ingestion.quarterly_resample import infer_periods_per_year
 from app.schemas.vcp_schema import VCPMilestone
 from app.store.vcp_store import VCPStore
 
@@ -138,13 +139,17 @@ def load_latest_financial_snapshot(financial_path: str) -> Dict[str, Any]:
 
     latest = df.iloc[-1].to_dict()
 
-    monthly_revenue = _safe_float(latest.get("revenue"))
-    monthly_ebitda = _safe_float(latest.get("ebitda"))
+    # Reporting cadence varies by source (monthly private CSVs, quarterly EDGAR
+    # filings); annualize by the actual periods-per-year, never a fixed ×12.
+    periods_per_year = infer_periods_per_year(df)
+
+    period_revenue = _safe_float(latest.get("revenue"))
+    period_ebitda = _safe_float(latest.get("ebitda"))
     ebitda_margin = _safe_float(latest.get("ebitda_margin"))
     net_debt = _safe_float(latest.get("net_debt"))
 
-    annualized_revenue = monthly_revenue * 12 if monthly_revenue is not None else None
-    annualized_ebitda = monthly_ebitda * 12 if monthly_ebitda is not None else None
+    annualized_revenue = period_revenue * periods_per_year if period_revenue is not None else None
+    annualized_ebitda = period_ebitda * periods_per_year if period_ebitda is not None else None
 
     net_debt_to_ebitda = None
     if net_debt is not None and annualized_ebitda not in {None, 0}:
@@ -158,8 +163,9 @@ def load_latest_financial_snapshot(financial_path: str) -> Dict[str, Any]:
         "annual_revenue": annualized_revenue,
         "ebitda_margin": ebitda_margin,
         "net_debt_to_ebitda": net_debt_to_ebitda,
-        "monthly_revenue": monthly_revenue,
-        "monthly_ebitda": monthly_ebitda,
+        "period_revenue": period_revenue,
+        "period_ebitda": period_ebitda,
+        "periods_per_year": periods_per_year,
         "net_debt": net_debt,
     }
 
@@ -341,27 +347,31 @@ def load_latest_kpi_snapshot_from_records(kpi_records_path: str) -> Dict[str, An
 
     latest = df.iloc[-1].to_dict()
 
-    monthly_revenue = _safe_float(latest.get("revenue"))
+    # Reporting cadence varies by source (monthly private CSVs, quarterly EDGAR
+    # filings); annualize by the actual periods-per-year, never a fixed ×12.
+    periods_per_year = infer_periods_per_year(df)
+
+    period_revenue = _safe_float(latest.get("revenue"))
 
     # Prefer adjusted EBITDA for private-company PE monitoring.
     # Fall back to ebitda_proxy if adjusted_ebitda is unavailable.
-    monthly_ebitda = _safe_float(latest.get("adjusted_ebitda"))
-    if monthly_ebitda is None:
-        monthly_ebitda = _safe_float(latest.get("ebitda_proxy"))
+    period_ebitda = _safe_float(latest.get("adjusted_ebitda"))
+    if period_ebitda is None:
+        period_ebitda = _safe_float(latest.get("ebitda_proxy"))
 
     ebitda_margin = _safe_float(latest.get("ebitda_margin"))
 
     # If margin is not stored, derive it safely.
-    if ebitda_margin is None and monthly_revenue not in {None, 0} and monthly_ebitda is not None:
-        ebitda_margin = monthly_ebitda / monthly_revenue
+    if ebitda_margin is None and period_revenue not in {None, 0} and period_ebitda is not None:
+        ebitda_margin = period_ebitda / period_revenue
 
     net_debt = _safe_float(latest.get("net_debt"))
 
     annualized_revenue = (
-        monthly_revenue * 12 if monthly_revenue is not None else None
+        period_revenue * periods_per_year if period_revenue is not None else None
     )
     annualized_ebitda = (
-        monthly_ebitda * 12 if monthly_ebitda is not None else None
+        period_ebitda * periods_per_year if period_ebitda is not None else None
     )
 
     net_debt_to_ebitda = None
@@ -376,8 +386,9 @@ def load_latest_kpi_snapshot_from_records(kpi_records_path: str) -> Dict[str, An
         "annual_revenue": annualized_revenue,
         "ebitda_margin": ebitda_margin,
         "net_debt_to_ebitda": net_debt_to_ebitda,
-        "monthly_revenue": monthly_revenue,
-        "monthly_ebitda": monthly_ebitda,
+        "period_revenue": period_revenue,
+        "period_ebitda": period_ebitda,
+        "periods_per_year": periods_per_year,
         "net_debt": net_debt,
     }
 

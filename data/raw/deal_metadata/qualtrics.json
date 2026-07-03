@@ -1,0 +1,18 @@
+{
+  "company_id": "qualtrics",
+  "company_name": "Qualtrics International Inc.",
+  "deal_close_date": "2023-06-23",
+  "entry_ebitda": 219000000.0,
+  "entry_ev_multiple": 57.08,
+  "entry_enterprise_value": 12500000000.0,
+  "entry_net_debt": 1530000000.0,
+  "entry_equity_value": 10970000000.0,
+  "holding_period_years": 5.0,
+  "fund_vintage": 2023,
+  "ic_target_irr": null,
+  "ic_target_moic": null,
+  "currency": "USD",
+  "source_document": "DEFM14C (SEC, filed 2023-05-11, CIK 0001747748) \u2014 Sources & Uses, Ten-Year Projections (Non-GAAP Operating Income FY2023E).",
+  "notes": "Real public-to-private take-private: Silver Lake Partners + CPP Investments acquired Qualtrics at $18.15/share ($10.97bn equity financing: $9.22bn SLP + $1.75bn CPPIB; ~$1.2bn debt financing; 605,769,288 shares outstanding). Signed 2023-03-12, closed 2023-06-23 (verified via 8-K filed 2023-06-26, not the signing date). Entry EBITDA uses the proxy's disclosed Non-GAAP Operating Income FY2023E ($219mm) since GAAP OperatingIncomeLoss is deeply negative (stock-based-comp heavy, typical for a recent-IPO SaaS issuer) and is not a defensible entry multiple basis. entry_net_debt is an estimate (cash less debt at close is not separately broken out in the proxy's Sources & Uses); entry_enterprise_value derived as entry_equity_value + entry_net_debt against the disclosed equity financing total. Monetary fields are in absolute currency units (USD), matching the DealMetadata convention used by all companies.",
+  "sector_key": "b2b_saas"
+}

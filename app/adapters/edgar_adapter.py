@@ -40,9 +40,14 @@ class EDGARFeatureMatrixAdapter(BaseKPIAdapter):
         "revenue": "revenue",
         "operating_income": "operating_income",
         "net_income": "net_income",
+        "gross_profit": "gross_profit",
         "ebitda_proxy": "ebitda_proxy",
         "working_capital": "working_capital",
         "net_debt": "net_debt",
+        # ARR proxy (RPO/deferred revenue) has no dedicated KPIRecord field — it still
+        # flows into evidence_refs below so SaaS filers' subscription backlog is
+        # citable evidence even though it isn't a first-class monitored metric yet.
+        "arr_proxy": "arr_proxy",
     }
 
     def extract(self, config: KPIExtractionConfig) -> Dict[str, Any]:
@@ -115,6 +120,7 @@ class EDGARFeatureMatrixAdapter(BaseKPIAdapter):
                 period_type="quarter",
                 currency="USD",
                 revenue=clean_value(row.get("revenue")),
+                gross_profit=clean_value(row.get("gross_profit")),
                 operating_income=clean_value(row.get("operating_income")),
                 net_income=clean_value(row.get("net_income")),
                 ebitda_proxy=clean_value(row.get("ebitda_proxy")),

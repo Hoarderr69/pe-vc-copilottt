@@ -61,9 +61,14 @@ def _ensure_forecast(company_id: str, refresh: bool = False) -> pd.DataFrame:
     forecast_path = FORECAST_DIR / f"{company_id}_quant_ebitda_forecast.csv"
     if forecast_path.exists() and not refresh:
         return pd.read_csv(forecast_path)
+    # Forecast adjusted EBITDA when the source discloses it — that matches the
+    # deal's entry-multiple basis. ebitda_proxy (GAAP operating income) is the
+    # fallback for issuers without an adjusted figure.
+    feature_cols = pd.read_csv(feature_path, nrows=0).columns
+    target_col = "adjusted_ebitda" if "adjusted_ebitda" in feature_cols else "ebitda_proxy"
     config = ForecastConfig(
         feature_path=str(feature_path),
-        target_col="ebitda_proxy",
+        target_col=target_col,
         periods=20,
         output_path=str(forecast_path),
         stl_output_path=str(FORECAST_DIR / f"{company_id}_stl_components.csv"),
@@ -71,12 +76,34 @@ def _ensure_forecast(company_id: str, refresh: bool = False) -> pd.DataFrame:
     return run_quant_forecast(config)
 
 
+def _trailing_year_sum(kpi_records: List[Dict], fields: tuple[str, ...]) -> Optional[float]:
+    """Sum a flow metric over the records inside the trailing 365 days.
+
+    Date-window based so it is correct at any reporting cadence (monthly private
+    CSVs, quarterly EDGAR filings) — never "last 12 rows".
+    """
+    dated = [
+        (pd.Timestamp(r["period_end"]), r)
+        for r in kpi_records
+        if r.get("period_end") and any(r.get(f) is not None for f in fields)
+    ]
+    if not dated:
+        return None
+    latest = max(d for d, _ in dated)
+    window = [r for d, r in dated if d > latest - pd.Timedelta(days=365)]
+    total = 0.0
+    for r in window:
+        for f in fields:
+            if r.get(f) is not None:
+                total += float(r[f])
+                break
+    return total
+
+
 def _annual_fcf(kpi_records: List[Dict]) -> float:
-    """Latest annual free-cash-flow run-rate (sum of last 12 months), for debt paydown."""
-    fcf = [r.get("free_cash_flow") for r in kpi_records if r.get("free_cash_flow") is not None]
-    if not fcf:
-        return 0.0
-    return float(sum(fcf[-12:]))
+    """Latest annual free-cash-flow run-rate (trailing 365 days), for debt paydown."""
+    total = _trailing_year_sum(kpi_records, ("free_cash_flow",))
+    return float(total) if total is not None else 0.0
 
 
 def _exit_net_debt(deal: DealMetadata, annual_fcf: float, hold_years: float) -> float:
@@ -91,6 +118,24 @@ def build_vcp_irr(company_id: str, kpi_records: List[Dict]) -> Dict[str, Any]:
         raise FileNotFoundError(
             f"No deal metadata for {company_id}. Entry equity is required for IRR; "
             "seed data/raw/deal_metadata/{company_id}.json."
+        )
+
+    # Unit-consistency guard: DealMetadata monetary fields are absolute currency
+    # units, same as KPI records. A deal file denominated in millions makes every
+    # exit-equity and MOIC figure off by ~1e6 — refuse loudly rather than render it.
+    trailing_revenue = _trailing_year_sum(kpi_records, ("revenue",))
+    if (
+        trailing_revenue is not None
+        and trailing_revenue > 0
+        and deal.entry_enterprise_value > 0
+        and deal.entry_enterprise_value < trailing_revenue / 1000
+    ):
+        raise ValueError(
+            f"Deal metadata for {company_id} looks denominated in millions "
+            f"(entry EV {deal.entry_enterprise_value:,.0f} vs trailing revenue "
+            f"{trailing_revenue:,.0f}). DealMetadata fields must be absolute "
+            "currency units — rescale data/raw/deal_metadata/"
+            f"{company_id}.json."
         )
 
     forecast = _ensure_forecast(company_id)
@@ -147,6 +192,39 @@ def build_vcp_irr(company_id: str, kpi_records: List[Dict]) -> Dict[str, Any]:
                     "irr_percent": round(irr * 100, 2),
                 })
 
+    # Equity-at-risk: base-case exit equity is zero or negative — the model
+    # projects that net debt exceeds EBITDA*multiple at exit. This is a
+    # first-class signal, not a missing-data artefact: surface it explicitly
+    # so the UI can render an alert rather than a blank "—" in the IRR grid.
+    base_exit_equity = scenarios[1]["exit_equity"]
+    equity_at_risk = base_exit_equity <= 0
+
+    # Net debt / trailing EBITDA leverage ratio for the alert context.
+    trailing_annual_ebitda = _trailing_year_sum(
+        kpi_records, ("adjusted_ebitda", "ebitda_proxy")
+    )
+    nd_ebitda = (
+        round(deal.entry_net_debt / trailing_annual_ebitda, 1)
+        if trailing_annual_ebitda is not None and trailing_annual_ebitda > 0 else None
+    )
+
+    # Basis guard: the entry multiple was struck on the deal's entry EBITDA
+    # basis (often adjusted / non-GAAP). If that basis is positive but the
+    # forecastable EBITDA proxy is negative (e.g. GAAP operating income for an
+    # SBC-heavy issuer), applying entry multiple × forecast EBITDA is not a
+    # meaningful exit value — flag it instead of raising a distress alarm.
+    basis_mismatch = (
+        deal.entry_ebitda is not None
+        and deal.entry_ebitda > 0
+        and exit_ebitda["base"] <= 0
+    )
+    basis_warning = (
+        "Entry EBITDA basis is positive but the quant forecast's EBITDA proxy is "
+        "negative — the forecast basis (GAAP operating-income proxy) differs from "
+        "the deal's entry EBITDA basis. IRR scenarios are not comparable; ingest an "
+        "adjusted-EBITDA series to enable projection."
+    ) if basis_mismatch else None
+
     return {
         "company_id": company_id,
         "currency": deal.currency,
@@ -162,12 +240,37 @@ def build_vcp_irr(company_id: str, kpi_records: List[Dict]) -> Dict[str, Any]:
             "ic_underwritten": ic_underwritten,
             "gap_bps": gap_bps,
         },
+        "basis_mismatch": basis_mismatch,
+        "basis_warning": basis_warning,
+        # A negative-basis forecast is a data-basis problem, not evidence of
+        # distress — don't raise the equity-at-risk alarm on top of it.
+        "equity_at_risk": equity_at_risk and not basis_mismatch,
+        "equity_at_risk_detail": {
+            "base_exit_equity": round(base_exit_equity, 2),
+            "entry_net_debt": deal.entry_net_debt,
+            "terminal_ebitda_base": round(exit_ebitda["base"], 2),
+            "nd_ebitda_trailing": nd_ebitda,
+        } if equity_at_risk and not basis_mismatch else None,
         "scenario_detail": scenarios,
         # provenance / assumptions
         "entry_equity": entry_equity,
+        "entry_ebitda": deal.entry_ebitda,
+        "entry_net_debt": deal.entry_net_debt,
         "entry_multiple": base_multiple,
         "base_hold_years": base_hold,
         "annual_fcf_sweep": round(annual_fcf, 2),
         "terminal_ebitda": {k: round(v, 2) for k, v in exit_ebitda.items()},
+        # quarterly P10/P50/P90 EBITDA path from the quant forecast ensemble — feeds
+        # the report's EBITDA Forward Curve slide so it shows the same numbers as
+        # this endpoint, not a separately-invented projection.
+        "forecast_quarterly": [
+            {
+                "period_end": str(row["period_end"])[:10],
+                "p10": round(float(row["p10"]), 2),
+                "p50": round(float(row["p50"]), 2),
+                "p90": round(float(row["p90"]), 2),
+            }
+            for row in forecast.to_dict(orient="records")
+        ],
         "basis": "quant_forecast_p10_p50_p90",
     }

@@ -1,0 +1,48 @@
+[
+  {
+    "company_id": "qualtrics",
+    "company_name": "Qualtrics International Inc.",
+    "initiative": "Revenue Growth (Ten-Year Projections, Management Case)",
+    "metric": "annual_revenue",
+    "target_value": 4201000000.0,
+    "target_date": "2027-12-31",
+    "category": "financial",
+    "owner_role": "CEO",
+    "baseline_value": 1754000000.0,
+    "confidence": 0.8,
+    "source_document": "DEFM14C (SEC, filed 2023-05-11) — 'Certain Unaudited Prospective Financial Information' (Ten-Year Projections table)",
+    "source_text": "Management's Ten-Year Projections disclosed in the proxy show total revenue growing from approximately $1,754 million in FY2023E to approximately $4,201 million in FY2027E, a ~24% CAGR over the underwritten 5-year hold.",
+    "confirmed": true,
+    "version": 1,
+    "metadata": {
+      "extraction_mode": "manual_from_sec_filing",
+      "value_unit": "currency",
+      "target_horizon_months": 54,
+      "ambiguity_note": "Deal closed 2023-06-23, mid-way through FY2023E; baseline uses the full-year FY2023E projection as the closest disclosed reference point rather than an interim actual.",
+      "document_loader": "pdf_manual_review"
+    }
+  },
+  {
+    "company_id": "qualtrics",
+    "company_name": "Qualtrics International Inc.",
+    "initiative": "Non-GAAP Operating Margin Expansion (Ten-Year Projections, Management Case)",
+    "metric": "ebitda_margin",
+    "target_value": 0.267,
+    "target_date": "2027-12-31",
+    "category": "financial",
+    "owner_role": "CFO",
+    "baseline_value": 0.125,
+    "confidence": 0.8,
+    "source_document": "DEFM14C (SEC, filed 2023-05-11) — 'Certain Unaudited Prospective Financial Information' (Ten-Year Projections table)",
+    "source_text": "Management's Ten-Year Projections show Non-GAAP Operating Income margin expanding from approximately 12.5% in FY2023E to approximately 26.7% in FY2027E, driven by operating leverage as the subscription base scales. Used as the EBITDA-margin proxy here since the company does not disclose a GAAP EBITDA figure (GAAP operating income is negative due to stock-based compensation).",
+    "confirmed": true,
+    "version": 1,
+    "metadata": {
+      "extraction_mode": "manual_from_sec_filing",
+      "value_unit": "ratio",
+      "target_horizon_months": 54,
+      "ambiguity_note": "Non-GAAP operating margin used as the EBITDA-margin proxy; not a GAAP-equivalent figure.",
+      "document_loader": "pdf_manual_review"
+    }
+  }
+]

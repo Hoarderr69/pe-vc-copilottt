@@ -401,8 +401,34 @@ def _benchmark_rows(peer_benchmark: Optional[Dict[str, Any]]) -> List[Dict[str, 
 
 def _deal_assumptions(milestones: List[Dict[str, Any]],
                       series: List[Dict[str, Any]],
-                      irr_scenarios: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """Derive entry/exit assumptions for the IRR matrix from available data."""
+                      irr_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Entry/exit assumptions for the IRR matrix and forward curve.
+
+    Prefers the live quant engine's output (``irr_data`` from
+    ``app.quant.vcp_irr.build_vcp_irr`` — real entry economics from the
+    DealMetadata store + forecast-derived exit EBITDA). Falls back to a
+    milestone-derived heuristic only when the quant engine couldn't run
+    (missing deal metadata or feature matrix for the company).
+    """
+    if irr_data:
+        ic_target_irr = (irr_data["summary"].get("ic_underwritten") or 19.0) / 100.0
+        ic_year = round(irr_data.get("base_hold_years") or 5)
+        return {
+            "entry_equity": irr_data["entry_equity"],
+            "entry_ebitda": irr_data["entry_ebitda"],
+            "target_ebitda": irr_data["terminal_ebitda"]["base"],
+            "entry_multiple": irr_data["entry_multiple"],
+            "net_debt": irr_data["entry_net_debt"],
+            "horizon_yrs": irr_data.get("base_hold_years") or 5.0,
+            "terminal_growth": 0.05,
+            "ic_irr": ic_target_irr,
+            "ic_multiple": irr_data["entry_multiple"],
+            "ic_year": ic_year,
+            "base_irr": irr_data["summary"].get("base_p50"),
+            "source": "quant_forecast",
+        }
+
     by_metric = {m.get("metric"): m for m in milestones}
 
     base_rev = _f((by_metric.get("annual_revenue") or {}).get("baseline_value")) or \
@@ -432,15 +458,6 @@ def _deal_assumptions(milestones: List[Dict[str, Any]],
 
     current_net_debt = _latest(series, "net_debt") or entry_net_debt
 
-    # IC underwritten case + current P50 trajectory (best-effort from irr_scenarios).
-    ic_irr, base_irr = 0.19, None
-    if irr_scenarios:
-        for s in irr_scenarios:
-            if str(s.get("scenario", "")).lower() == "base" and s.get("irr_percent") is not None:
-                base_irr = _f(s.get("irr_percent")) / 100.0
-            if s.get("ic_target_irr") is not None:
-                ic_irr = _f(s.get("ic_target_irr"))
-
     return {
         "entry_equity": entry_equity,
         "entry_ebitda": entry_ebitda,
@@ -449,10 +466,11 @@ def _deal_assumptions(milestones: List[Dict[str, Any]],
         "net_debt": current_net_debt,
         "horizon_yrs": horizon_yrs,
         "terminal_growth": terminal_growth,
-        "ic_irr": ic_irr,
+        "ic_irr": 0.19,
         "ic_multiple": 10.0,
         "ic_year": 5,
-        "base_irr": base_irr,
+        "base_irr": None,
+        "source": "vcp_heuristic_fallback",
     }
 
 
@@ -473,20 +491,53 @@ def _exit_ebitda(assumptions: Dict[str, Any], year: int) -> float:
     return tgt * (1 + g_term) ** (year - horizon)
 
 
-def _irr_matrix(assumptions: Dict[str, Any]) -> Dict[str, Any]:
+def _rag(irr: float) -> str:
+    if irr >= 0.25:
+        return "green"
+    if irr >= 0.15:
+        return "amber"
+    return "red"
+
+
+def _irr_matrix(assumptions: Dict[str, Any], irr_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Exit-multiple x hold-year IRR sensitivity grid.
+
+    Uses the quant engine's matrix (P50 forecast exit EBITDA, real entry equity/debt
+    from DealMetadata) when available; falls back to a deterministic linear-ramp
+    estimate only when the quant engine couldn't run for this company.
+    """
+    if irr_data:
+        exit_multiples = irr_data["exit_multiples"]
+        hold_years = irr_data["hold_years"]
+        by_mult: Dict[float, Dict[float, float]] = {}
+        for row in irr_data["scenarios"]:
+            by_mult.setdefault(row["exit_multiple"], {})[row["hold_years"]] = row["irr_percent"]
+
+        grid: List[Dict[str, Any]] = []
+        for mult in exit_multiples:
+            cells = []
+            for yr in hold_years:
+                irr_pct = by_mult.get(mult, {}).get(yr)
+                irr = (irr_pct / 100.0) if irr_pct is not None else -1.0
+                cells.append({
+                    "year": yr,
+                    "irr": round(irr, 4),
+                    "irr_pct": f"{irr * 100:.1f}%",
+                    "rag": _rag(irr),
+                    "ic_cell": abs(mult - assumptions["ic_multiple"]) < 0.01 and yr == assumptions["ic_year"],
+                    "p50_cell": abs(mult - assumptions["entry_multiple"]) < 1.01 and yr == assumptions["ic_year"],
+                })
+            grid.append({"exit_multiple": mult, "exit_multiple_label": f"{mult:.1f}x", "cells": cells})
+
+        return {"exit_multiples": exit_multiples, "hold_years": hold_years, "grid": grid}
+
     exit_multiples = [8.0, 10.0, 12.0, 14.0, 16.0]
     hold_years = [3, 4, 5, 6, 7]
     eq = assumptions["entry_equity"]
     nd = assumptions["net_debt"]
 
-    def rag(irr: float) -> str:
-        if irr >= 0.25:
-            return "green"
-        if irr >= 0.15:
-            return "amber"
-        return "red"
-
-    grid: List[Dict[str, Any]] = []
+    grid = []
     for mult in exit_multiples:
         cells = []
         for yr in hold_years:
@@ -500,7 +551,7 @@ def _irr_matrix(assumptions: Dict[str, Any]) -> Dict[str, Any]:
                 "year": yr,
                 "irr": round(irr, 4),
                 "irr_pct": f"{irr * 100:.1f}%",
-                "rag": rag(irr),
+                "rag": _rag(irr),
                 "ic_cell": abs(mult - assumptions["ic_multiple"]) < 0.01 and yr == assumptions["ic_year"],
                 "p50_cell": abs(mult - assumptions["entry_multiple"]) < 1.01 and yr == assumptions["ic_year"],
             })
@@ -529,7 +580,7 @@ def build_slides(
     alert_card: Dict[str, Any],
     narrative: Dict[str, Any],
     peer_benchmark: Optional[Dict[str, Any]] = None,
-    irr_scenarios: Optional[List[Dict[str, Any]]] = None,
+    irr_data: Optional[Dict[str, Any]] = None,
     board_questions: Optional[List[str]] = None,
     risks_output: Optional[Dict[str, Any]] = None,
     citations: Optional[List[str]] = None,
@@ -550,8 +601,8 @@ def build_slides(
     ms_counts = _milestone_counts(ms_rows)
     kpi_rows = _kpi_scorecard_rows(drift_results, kpi_series)
     bench_rows = _benchmark_rows(peer_benchmark)
-    assumptions = _deal_assumptions(milestones, kpi_series, irr_scenarios)
-    irr_matrix = _irr_matrix(assumptions)
+    assumptions = _deal_assumptions(milestones, kpi_series, irr_data)
+    irr_matrix = _irr_matrix(assumptions, irr_data)
 
     period_full = full_period(period)
     period_q = quarter_period(period)
@@ -560,7 +611,7 @@ def build_slides(
     sector_label = (peer_benchmark.get("sector_label") if peer_benchmark else None) or sector or "—"
 
     # IRR scenario inset (bear/base/bull/IC) — best-effort
-    irr_inset = _irr_inset(irr_scenarios, assumptions)
+    irr_inset = _irr_inset(irr_data["scenario_detail"] if irr_data else None, assumptions)
 
     slides: List[Dict[str, Any]] = []
 
@@ -686,7 +737,7 @@ def build_slides(
     }))
 
     # --- Slide 6: EBITDA Forward Curve -------------------------------------
-    forward = _forward_curve(kpi_series, milestones, drift_results)
+    forward = _forward_curve(kpi_series, milestones, drift_results, irr_data)
     fc_msg = truncate_words("P50 forecast vs IC exit target; SG&A discipline required", 10)
     slides.append(_slide("forward_curve", 5, "ForwardCurve", "EBITDA Forward Curve", fc_msg, {
         "kpi_strip": forward["kpi_strip"],
@@ -698,6 +749,9 @@ def build_slides(
         "methodology": (
             "STL decomposition + SARIMA ensemble + Prophet · FRED macro regressors "
             "(DFF, INDPRO, CPILFESL) · P10–P90 band = model uncertainty range"
+            if irr_data else
+            "Quant forecast unavailable for this company (missing deal metadata or "
+            "model feature matrix) · flat trend extrapolation shown as a placeholder"
         ),
     }))
 
@@ -752,7 +806,13 @@ def build_slides(
             "gap_bps": gap_bps,
         },
         "legend": "Green ≥25% · Amber 15–24% · Red <15%",
-        "methodology": "STL + SARIMA + Prophet ensemble · entry equity & deal debt derived from VCP baseline",
+        "methodology": (
+            "STL + SARIMA + Prophet ensemble · entry equity & deal debt from DealMetadata "
+            "(IC memo Sources & Uses)"
+            if irr_data else
+            "Quant forecast unavailable for this company · deterministic linear-ramp "
+            "estimate shown as a placeholder"
+        ),
     }))
 
     # --- Slide 10: Audit Trail ---------------------------------------------
@@ -832,7 +892,8 @@ def _irr_inset(irr_scenarios: Optional[List[Dict[str, Any]]],
 
 def _forward_curve(series: List[Dict[str, Any]],
                    milestones: List[Dict[str, Any]],
-                   drift_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+                   drift_results: List[Dict[str, Any]],
+                   irr_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build the EBITDA line series + projection band (bug #2: raw multiples, no ×100)."""
     sorted_series = sorted(series, key=lambda r: r.get("period_end", ""))
     actual_points = [
@@ -841,20 +902,32 @@ def _forward_curve(series: List[Dict[str, Any]],
     ]
     now_index = len(actual_points) - 1
 
-    # Simple forward projection: extend last EBITDA along the VCP-implied trend.
-    last_eb = actual_points[-1]["ebitda"] if actual_points else 0.0
-    by_metric = {m.get("metric"): m for m in milestones}
-    tgt = _f((by_metric.get("ebitda_margin") or {}).get("target_value"))
-    proj = []
-    g = 0.02
-    for i in range(1, 7):
-        p50 = last_eb * (1 + g) ** i
-        proj.append({
-            "period": f"+{i}Q",
-            "p50": round(p50, 2),
-            "p10": round(p50 * 0.85, 2),
-            "p90": round(p50 * 1.15, 2),
-        })
+    forecast_quarterly = irr_data.get("forecast_quarterly") if irr_data else None
+    if forecast_quarterly:
+        # Live quant-engine forecast (STL + SARIMA/SARIMAX + Prophet ensemble).
+        proj = [
+            {
+                "period": f"+{i}Q",
+                "p50": row["p50"],
+                "p10": row["p10"],
+                "p90": row["p90"],
+            }
+            for i, row in enumerate(forecast_quarterly[:6], start=1)
+        ]
+    else:
+        # Fallback: extend last EBITDA along a flat trend (no quant engine output
+        # for this company — missing deal metadata or model feature matrix).
+        last_eb = actual_points[-1]["ebitda"] if actual_points else 0.0
+        proj = []
+        g = 0.02
+        for i in range(1, 7):
+            p50 = last_eb * (1 + g) ** i
+            proj.append({
+                "period": f"+{i}Q",
+                "p50": round(p50, 2),
+                "p10": round(p50 * 0.85, 2),
+                "p90": round(p50 * 1.15, 2),
+            })
 
     drift_margin = next((d for d in drift_results if d.get("metric") == "ebitda_margin"), {})
     actual_margin = _f(drift_margin.get("actual_value"))

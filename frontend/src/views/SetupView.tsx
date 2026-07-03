@@ -24,17 +24,48 @@ import {
   getExtractStatus,
   runExtraction,
   runExtractionFromUpload,
+  seedCompany,
   type CompanyOverview,
   type ConfirmedVcp,
   type ExtractStatus,
   type ExtractedMilestone,
   type ExtractionResult,
+  type SeedCompanyResult,
 } from "../lib/api";
 import { Badge, SectionLabel } from "../components/ui";
 import { metricLabel, metricValue, shortDate } from "../lib/format";
 
 const REVIEWER = "operating.partner@firm.com";
 const ACCEPT = ".pdf,.docx,.pptx,.html,.xhtml,.md,.markdown,.txt";
+
+const SECTOR_OPTIONS = [
+  { value: "", label: "— Select sector —" },
+  { value: "b2b_saas", label: "B2B SaaS" },
+  { value: "industrial_manufacturing", label: "Industrial / Manufacturing" },
+  { value: "healthcare_services", label: "Healthcare Services" },
+];
+
+interface DealMetaForm {
+  cik: string;
+  ticker: string;
+  sector_key: string;
+  deal_close_date: string;
+  currency: string;
+  entry_ebitda: string;
+  entry_ev_multiple: string;
+  entry_enterprise_value: string;
+  entry_net_debt: string;
+  entry_equity_value: string;
+  holding_period_years: string;
+  fund_vintage: string;
+}
+
+const DEAL_META_INIT: DealMetaForm = {
+  cik: "", ticker: "", sector_key: "", deal_close_date: "",
+  currency: "USD", entry_ebitda: "", entry_ev_multiple: "",
+  entry_enterprise_value: "", entry_net_debt: "",
+  entry_equity_value: "", holding_period_years: "", fund_vintage: "",
+};
 
 function slugify(name: string) {
   return (
@@ -45,21 +76,26 @@ function slugify(name: string) {
   );
 }
 
-export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
+export function SetupView({ companies, onVcpLocked, onGoToIngest, onOpenCompany }: {
   companies: CompanyOverview[];
   onVcpLocked?: () => void;
   onGoToIngest?: () => void;
+  onOpenCompany?: (id: string) => void;
 }) {
   const wide = useWide(960);
   const [status, setStatus] = useState<ExtractStatus | null>(null);
   const [activeId, setActiveId] = useState<string>("");
   const [isNewCompany, setIsNewCompany] = useState(true);
   const [newCompanyName, setNewCompanyName] = useState("");
+  const [dataSource, setDataSource] = useState<"private" | "edgar">("private");
+  const [dealMeta, setDealMeta] = useState<DealMetaForm>(DEAL_META_INIT);
   const [result, setResult] = useState<ExtractionResult | null>(null);
   const [items, setItems] = useState<ExtractedMilestone[]>([]);
   const [confirmed, setConfirmed] = useState<ConfirmedVcp | null>(null);
+  const [edgarResult, setEdgarResult] = useState<SeedCompanyResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [seedingEdgar, setSeedingEdgar] = useState(false);
   const [err, setErr] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [uploadName, setUploadName] = useState<string>("");
@@ -69,15 +105,41 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
   const live = status?.mode === "azure_openai";
   const hasExistingVcp = confirmed?.confirmed && confirmed.milestone_count > 0;
 
-  // For new company mode: company identity comes from the name field OR is auto-detected from document
+  // EDGAR path: only available for new investments
+  const isEdgar = isNewCompany && dataSource === "edgar";
+  // Step 2 (Deal Economics) is "done" once the CIK field is non-empty
+  const dealMetaDone = !isEdgar || !!dealMeta.cik.trim();
+
   const resolvedCompanyId = isNewCompany ? slugify(newCompanyName) : activeId;
   const resolvedCompanyName = isNewCompany
     ? newCompanyName
     : activeCompany?.company_name;
-
-  // Step is ready to upload when: existing company selected OR new company has a name entered (or will be auto-detected)
   const companyReady = isNewCompany ? true : !!activeId;
-  const step = !companyReady ? 1 : !result ? 2 : 3;
+
+  // Steps array drives the StepBar — EDGAR gets an extra "Deal Economics" step
+  const steps = isEdgar
+    ? ["Company Setup", "Deal Economics", "IC Memo", "Review & Confirm"]
+    : ["Select Company", "Upload Document", "Review & Confirm"];
+
+  const step = !companyReady
+    ? 1
+    : isEdgar && !dealMetaDone
+      ? 2
+      : !result
+        ? isEdgar ? 3 : 2
+        : isEdgar ? 4 : 3;
+
+  function patchDeal<K extends keyof DealMetaForm>(k: K, v: DealMetaForm[K]) {
+    setDealMeta((d) => ({ ...d, [k]: v }));
+  }
+  function numOrNull(s: string): number | null {
+    const n = parseFloat(s);
+    return s.trim() !== "" && !isNaN(n) ? n : null;
+  }
+  function intOrNull(s: string): number | null {
+    const n = parseInt(s, 10);
+    return s.trim() !== "" && !isNaN(n) ? n : null;
+  }
 
   const loadConfirmed = useCallback((cid: string) => {
     getConfirmedVcp(cid)
@@ -90,13 +152,23 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
       .then(setStatus)
       .catch(() => {});
   }, []);
+
   useEffect(() => {
     if (!isNewCompany && activeId) loadConfirmed(activeId);
     else setConfirmed(null);
     setResult(null);
     setItems([]);
     setErr("");
+    setEdgarResult(null);
   }, [activeId, isNewCompany, loadConfirmed]);
+
+  // Reset EDGAR-specific state when toggling between new/existing
+  useEffect(() => {
+    if (!isNewCompany) {
+      setDataSource("private");
+      setDealMeta(DEAL_META_INIT);
+    }
+  }, [isNewCompany]);
 
   async function run() {
     if (!resolvedCompanyId) return;
@@ -124,14 +196,11 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
     setUploadName(file.name);
     try {
       const r = await runExtractionFromUpload(file, {
-        // For new companies with no name entered yet, omit the ID so the backend
-        // derives it from the filename rather than falling back to "new_company".
         companyId: (isNewCompany && !newCompanyName) ? undefined : (resolvedCompanyId || undefined),
         companyName: resolvedCompanyName || undefined,
       });
       setResult(r);
       setItems(r.milestones);
-      // If the document revealed a company name and we're in new-company mode, pre-fill it
       if (isNewCompany && r.company_name && !newCompanyName) {
         setNewCompanyName(r.company_name);
       }
@@ -183,13 +252,51 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
     if (!cid) return;
     setConfirming(true);
     setErr("");
+    setEdgarResult(null);
     try {
+      // 1. Lock VCP milestones (always)
       await confirmVcp(cid, {
         company_name: result?.company_name || resolvedCompanyName,
         reviewed_by: REVIEWER,
         reviewer_note: `Confirmed ${items.length} milestone(s) via Setup review`,
         milestones: items,
       });
+
+      // 2. For EDGAR companies: save deal metadata + trigger EDGAR ingestion
+      if (isEdgar) {
+        setSeedingEdgar(true);
+        try {
+          const sr = await seedCompany({
+            company_id: cid,
+            company_name: result?.company_name || resolvedCompanyName || cid,
+            cik: dealMeta.cik.trim() || undefined,
+            ticker: dealMeta.ticker.trim() || undefined,
+            sector_key: dealMeta.sector_key || undefined,
+            deal_close_date: dealMeta.deal_close_date || undefined,
+            currency: dealMeta.currency || "USD",
+            entry_ebitda: numOrNull(dealMeta.entry_ebitda),
+            entry_ev_multiple: numOrNull(dealMeta.entry_ev_multiple),
+            entry_enterprise_value: numOrNull(dealMeta.entry_enterprise_value),
+            entry_net_debt: numOrNull(dealMeta.entry_net_debt),
+            entry_equity_value: numOrNull(dealMeta.entry_equity_value),
+            holding_period_years: numOrNull(dealMeta.holding_period_years),
+            fund_vintage: intOrNull(dealMeta.fund_vintage),
+          });
+          setEdgarResult(sr);
+        } catch (seedErr) {
+          setEdgarResult({
+            company_id: cid,
+            company_name: resolvedCompanyName || cid,
+            deal_metadata_saved: false,
+            edgar_ingested: false,
+            kpi_periods: 0,
+            errors: [seedErr instanceof Error ? seedErr.message : "Seeding failed"],
+          });
+        } finally {
+          setSeedingEdgar(false);
+        }
+      }
+
       setResult(null);
       setItems([]);
       loadConfirmed(cid);
@@ -198,11 +305,20 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
       setErr(e instanceof Error ? e.message : "Confirmation failed");
     } finally {
       setConfirming(false);
+      setSeedingEdgar(false);
     }
   }
 
+  const uploadBlocked = !companyReady || (isEdgar && !dealMetaDone);
+
   return (
     <div>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.5; transform: scale(1.4); }
+        }
+      `}</style>
       <div className="page-head">
         <h1 className="page-title">VCP Setup</h1>
         <p className="page-sub">
@@ -215,28 +331,12 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
       {status && (
         <div
           className={`card card-pad extract-banner ${live ? "live" : "offline"}`}
-          style={{
-            marginBottom: 24,
-            display: "flex",
-            gap: 12,
-            alignItems: "center",
-          }}
+          style={{ marginBottom: 24, display: "flex", gap: 12, alignItems: "center" }}
         >
-          <Badge
-            status={live ? "Green" : "Amber"}
-            label={live ? "AGENT LIVE" : "OFFLINE"}
-          />
+          <Badge status={live ? "Green" : "Amber"} label={live ? "AGENT LIVE" : "OFFLINE"} />
           <div>
-            <div
-              style={{
-                fontSize: 13,
-                fontWeight: 600,
-                color: "var(--text-primary)",
-              }}
-            >
-              {live
-                ? `GPT extraction · ${status.deployment}`
-                : "Deterministic fallback (no LLM)"}
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+              {live ? `GPT extraction · ${status.deployment}` : "Deterministic fallback (no LLM)"}
             </div>
             <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
               {live
@@ -247,13 +347,10 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
         </div>
       )}
 
-      {/* Step indicators */}
-      <StepBar
-        step={step}
-        steps={["Select Company", "Upload Document", "Review & Confirm"]}
-      />
+      {/* Step indicators — dynamic for EDGAR (4 steps) vs private (3 steps) */}
+      <StepBar step={step} steps={steps} />
 
-      {/* ── STEP 1: Company Selection ── */}
+      {/* ── STEP 1: Company Selection / Setup ── */}
       <div className="card card-pad" style={{ marginBottom: 20 }}>
         <div
           style={{
@@ -268,10 +365,9 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
           <div>
             <StepBadge n={1} active={step >= 1} />
             <span style={{ fontWeight: 600, fontSize: 14, marginLeft: 10 }}>
-              Select Portfolio Company
+              {isNewCompany ? "Company Setup" : "Select Portfolio Company"}
             </span>
           </div>
-          {/* Toggle between existing and new company */}
           <div
             style={{
               display: "flex",
@@ -283,36 +379,22 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
             }}
           >
             <button
-              onClick={() => {
-                setIsNewCompany(false);
-                setNewCompanyName("");
-              }}
+              onClick={() => { setIsNewCompany(false); setNewCompanyName(""); }}
               style={{
-                padding: "5px 14px",
-                border: "none",
-                cursor: "pointer",
+                padding: "5px 14px", border: "none", cursor: "pointer",
                 fontWeight: !isNewCompany ? 600 : 400,
-                background: !isNewCompany
-                  ? "var(--accent)"
-                  : "var(--bg-surface)",
+                background: !isNewCompany ? "var(--accent)" : "var(--bg-surface)",
                 color: !isNewCompany ? "#fff" : "var(--text-secondary)",
               }}
             >
               Existing company
             </button>
             <button
-              onClick={() => {
-                setIsNewCompany(true);
-                setActiveId("");
-              }}
+              onClick={() => { setIsNewCompany(true); setActiveId(""); }}
               style={{
-                padding: "5px 14px",
-                border: "none",
-                cursor: "pointer",
+                padding: "5px 14px", border: "none", cursor: "pointer",
                 fontWeight: isNewCompany ? 600 : 400,
-                background: isNewCompany
-                  ? "var(--accent)"
-                  : "var(--bg-surface)",
+                background: isNewCompany ? "var(--accent)" : "var(--bg-surface)",
                 color: isNewCompany ? "#fff" : "var(--text-secondary)",
               }}
             >
@@ -323,20 +405,10 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
 
         {!isNewCompany ? (
           <>
-            <div
-              style={{
-                display: "flex",
-                gap: 12,
-                alignItems: "center",
-                flexWrap: "wrap",
-              }}
-            >
+            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
               <select
                 className="input"
-                style={{
-                  maxWidth: 340,
-                  fontWeight: activeId ? 600 : undefined,
-                }}
+                style={{ maxWidth: 340, fontWeight: activeId ? 600 : undefined }}
                 value={activeId}
                 onChange={(e) => setActiveId(e.target.value)}
               >
@@ -348,64 +420,32 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
                 ))}
               </select>
               {activeId && (
-                <span
-                  className="mono"
-                  style={{ fontSize: 12, color: "var(--text-muted)" }}
-                >
+                <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
                   ID: {activeId}
                 </span>
               )}
             </div>
 
-            {/* VCP lock status for selected company */}
             {activeCompany && (
               <div style={{ marginTop: 14 }}>
                 {hasExistingVcp ? (
                   <div
                     style={{
-                      display: "flex",
-                      alignItems: "flex-start",
-                      gap: 12,
-                      padding: "12px 14px",
-                      borderRadius: 8,
-                      background: "var(--amber-bg)",
+                      display: "flex", alignItems: "flex-start", gap: 12,
+                      padding: "12px 14px", borderRadius: 8, background: "var(--amber-bg)",
                     }}
                   >
                     <span style={{ fontSize: 18, marginTop: 1 }}>⚠</span>
                     <div>
-                      <div
-                        style={{
-                          fontWeight: 600,
-                          fontSize: 13,
-                          color: "var(--amber-text)",
-                          marginBottom: 3,
-                        }}
-                      >
-                        VCP already locked — {confirmed!.milestone_count}{" "}
-                        milestone(s) · version {confirmed!.version}
+                      <div style={{ fontWeight: 600, fontSize: 13, color: "var(--amber-text)", marginBottom: 3 }}>
+                        VCP already locked — {confirmed!.milestone_count} milestone(s) · version {confirmed!.version}
                       </div>
-                      <div
-                        style={{
-                          fontSize: 12.5,
-                          color: "var(--text-secondary)",
-                        }}
-                      >
-                        Uploading a new document will propose a{" "}
-                        <strong>new version</strong>. You'll review and confirm
-                        before it replaces the current VCP.
+                      <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
+                        Uploading a new document will propose a <strong>new version</strong>. You'll review and confirm before it replaces the current VCP.
                       </div>
-                      <div
-                        style={{
-                          display: "flex",
-                          gap: 6,
-                          marginTop: 8,
-                          flexWrap: "wrap",
-                        }}
-                      >
+                      <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
                         {confirmed!.milestones.map((m, i) => (
-                          <span key={i} className="chip">
-                            {metricLabel(m.metric)}
-                          </span>
+                          <span key={i} className="chip">{metricLabel(m.metric)}</span>
                         ))}
                       </div>
                     </div>
@@ -413,106 +453,330 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
                 ) : (
                   <div
                     style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 10,
-                      padding: "10px 14px",
-                      borderRadius: 8,
-                      background: "var(--bg-muted)",
-                      border: "1px solid var(--border)",
-                      fontSize: 13,
-                      color: "var(--text-secondary)",
+                      display: "flex", alignItems: "center", gap: 10,
+                      padding: "10px 14px", borderRadius: 8,
+                      background: "var(--bg-muted)", border: "1px solid var(--border)",
+                      fontSize: 13, color: "var(--text-secondary)",
                     }}
                   >
                     <span style={{ fontSize: 16 }}>○</span>
                     No VCP established yet for{" "}
-                    <strong
-                      style={{ color: "var(--text-primary)", marginLeft: 4 }}
-                    >
-                      {activeCompany.company_name}
-                    </strong>
-                    <span style={{ marginLeft: 4 }}>
-                      — upload an IC memo to begin.
-                    </span>
+                    <strong style={{ color: "var(--text-primary)", marginLeft: 4 }}>{activeCompany.company_name}</strong>
+                    <span style={{ marginLeft: 4 }}>— upload an IC memo to begin.</span>
                   </div>
                 )}
               </div>
             )}
           </>
         ) : (
-          /* New investment — company doesn't exist in portfolio yet */
+          /* New investment */
           <div>
-            <div style={{ marginBottom: 10 }}>
+            <div style={{ marginBottom: 14 }}>
               <label
                 style={{
-                  fontSize: 12,
-                  color: "var(--text-muted)",
-                  display: "block",
-                  marginBottom: 6,
-                  textTransform: "uppercase",
-                  letterSpacing: ".04em",
+                  fontSize: 12, color: "var(--text-muted)", display: "block",
+                  marginBottom: 6, textTransform: "uppercase", letterSpacing: ".04em",
                 }}
               >
                 Company name
               </label>
               <input
                 className="input"
-                style={{
-                  maxWidth: 360,
-                  fontWeight: newCompanyName ? 600 : undefined,
-                }}
+                style={{ maxWidth: 360, fontWeight: newCompanyName ? 600 : undefined }}
                 placeholder="e.g. Acme Holdings"
                 value={newCompanyName}
                 onChange={(e) => setNewCompanyName(e.target.value)}
               />
               {newCompanyName && (
-                <div
-                  className="mono"
-                  style={{
-                    fontSize: 12,
-                    color: "var(--text-muted)",
-                    marginTop: 6,
-                  }}
-                >
+                <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 6 }}>
                   Company ID will be: <strong>{slugify(newCompanyName)}</strong>
                 </div>
               )}
             </div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 10,
-                padding: "10px 14px",
-                borderRadius: 8,
-                background: "var(--bg-muted)",
-                border: "1px solid var(--border)",
-                fontSize: 12.5,
-                color: "var(--text-secondary)",
-              }}
-            >
-              <span style={{ marginTop: 1, flexShrink: 0 }}>💡</span>
-              <span>
-                You can leave the name blank and upload the IC memo — the agent
-                will automatically detect the company name from the document.
-                You can confirm or edit it before locking the VCP.
-              </span>
+
+            {/* Data source toggle */}
+            <div style={{ marginBottom: 14 }}>
+              <label
+                style={{
+                  fontSize: 12, color: "var(--text-muted)", display: "block",
+                  marginBottom: 8, textTransform: "uppercase", letterSpacing: ".04em",
+                }}
+              >
+                Data source
+              </label>
+              <div
+                style={{
+                  display: "inline-flex", gap: 0, borderRadius: 7,
+                  border: "1px solid var(--border)", overflow: "hidden", fontSize: 12.5,
+                }}
+              >
+                <button
+                  onClick={() => setDataSource("private")}
+                  style={{
+                    padding: "6px 16px", border: "none", cursor: "pointer",
+                    fontWeight: dataSource === "private" ? 600 : 400,
+                    background: dataSource === "private" ? "var(--accent)" : "var(--bg-surface)",
+                    color: dataSource === "private" ? "#fff" : "var(--text-secondary)",
+                  }}
+                >
+                  Private portco
+                </button>
+                <button
+                  onClick={() => setDataSource("edgar")}
+                  style={{
+                    padding: "6px 16px", border: "none", cursor: "pointer",
+                    fontWeight: dataSource === "edgar" ? 600 : 400,
+                    background: dataSource === "edgar" ? "var(--accent)" : "var(--bg-surface)",
+                    color: dataSource === "edgar" ? "#fff" : "var(--text-secondary)",
+                  }}
+                >
+                  Public take-private (EDGAR)
+                </button>
+              </div>
+
+              {isEdgar ? (
+                <div
+                  style={{
+                    marginTop: 10, display: "flex", alignItems: "flex-start", gap: 8,
+                    padding: "10px 14px", borderRadius: 8,
+                    background: "rgba(59,130,246,0.07)",
+                    border: "1px solid rgba(59,130,246,0.25)", fontSize: 12.5,
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
+                      background: "rgba(59,130,246,0.15)", color: "var(--blue-text, #60a5fa)",
+                      border: "1px solid rgba(59,130,246,0.3)", flexShrink: 0, marginTop: 1,
+                    }}
+                  >
+                    EDGAR
+                  </span>
+                  <span>
+                    Live financial data will be pulled directly from SEC public filings by CIK.
+                    Enter the company's CIK and deal economics in Step 2.
+                  </span>
+                </div>
+              ) : (
+                <div
+                  style={{
+                    marginTop: 10, display: "flex", alignItems: "flex-start", gap: 10,
+                    padding: "10px 14px", borderRadius: 8,
+                    background: "var(--bg-muted)", border: "1px solid var(--border)",
+                    fontSize: 12.5, color: "var(--text-secondary)",
+                  }}
+                >
+                  <span style={{ marginTop: 1, flexShrink: 0 }}>💡</span>
+                  <span>
+                    You can leave the name blank and upload the IC memo — the agent will
+                    automatically detect the company name from the document.
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         )}
       </div>
 
-      {/* ── STEP 2: Upload ── */}
+      {/* ── STEP 2 (EDGAR only): Deal Economics ── */}
+      {isEdgar && (
+        <div
+          className="card card-pad"
+          style={{
+            marginBottom: 20,
+            opacity: !companyReady ? 0.45 : 1,
+            pointerEvents: !companyReady ? "none" : undefined,
+          }}
+        >
+          <div style={{ marginBottom: 16 }}>
+            <StepBadge n={2} active={step >= 2} />
+            <span style={{ fontWeight: 600, fontSize: 14, marginLeft: 10 }}>
+              Deal Economics
+            </span>
+            <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: 10 }}>
+              CIK required · all other fields optional
+            </span>
+          </div>
+
+          {/* CIK — required */}
+          <div style={{ marginBottom: 16 }}>
+            <label
+              style={{
+                fontSize: 12, color: "var(--text-muted)", display: "block",
+                marginBottom: 6, textTransform: "uppercase", letterSpacing: ".04em",
+              }}
+            >
+              SEC CIK <span style={{ color: "var(--red-text, #f87171)", fontWeight: 700 }}>*</span>
+            </label>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <input
+                className="input mono"
+                style={{ maxWidth: 200, fontWeight: dealMeta.cik ? 600 : undefined }}
+                placeholder="e.g. 1747748"
+                value={dealMeta.cik}
+                onChange={(e) => patchDeal("cik", e.target.value.replace(/\D/g, ""))}
+              />
+              {dealMeta.cik && (
+                <a
+                  href={`https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${dealMeta.cik.padStart(10, "0")}&type=10-K&dateb=&owner=include&count=10`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ fontSize: 12, color: "var(--blue-text, #60a5fa)" }}
+                >
+                  View on SEC EDGAR ↗
+                </a>
+              )}
+            </div>
+            <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 5 }}>
+              Find at sec.gov/cgi-bin/browse-edgar or search the company name there.
+            </div>
+          </div>
+
+          {/* 2-column grid for deal fields */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: wide ? "1fr 1fr" : "1fr",
+              gap: "12px 20px",
+              marginBottom: 16,
+            }}
+          >
+            <DealField label="Sector">
+              <select
+                className="input"
+                value={dealMeta.sector_key}
+                onChange={(e) => patchDeal("sector_key", e.target.value)}
+              >
+                {SECTOR_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </DealField>
+
+            <DealField label="Deal close date">
+              <input
+                type="date"
+                className="input mono"
+                value={dealMeta.deal_close_date}
+                onChange={(e) => patchDeal("deal_close_date", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Entry EBITDA ($mm)">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 219"
+                value={dealMeta.entry_ebitda}
+                onChange={(e) => patchDeal("entry_ebitda", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Entry EV ($mm)">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 12500"
+                value={dealMeta.entry_enterprise_value}
+                onChange={(e) => patchDeal("entry_enterprise_value", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Entry equity value ($mm)">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 10970"
+                value={dealMeta.entry_equity_value}
+                onChange={(e) => patchDeal("entry_equity_value", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Entry net debt ($mm)">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 1530"
+                value={dealMeta.entry_net_debt}
+                onChange={(e) => patchDeal("entry_net_debt", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Hold period (years)">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 5"
+                min={1} max={15} step={0.5}
+                value={dealMeta.holding_period_years}
+                onChange={(e) => patchDeal("holding_period_years", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Fund vintage">
+              <input
+                type="number"
+                className="input mono"
+                placeholder="e.g. 2023"
+                min={2000} max={2050}
+                value={dealMeta.fund_vintage}
+                onChange={(e) => patchDeal("fund_vintage", e.target.value)}
+              />
+            </DealField>
+
+            <DealField label="Currency">
+              <select
+                className="input"
+                value={dealMeta.currency}
+                onChange={(e) => patchDeal("currency", e.target.value)}
+              >
+                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
+                <option value="GBP">GBP</option>
+              </select>
+            </DealField>
+
+            <DealField label="Ticker (optional)">
+              <input
+                className="input mono"
+                placeholder="e.g. XM"
+                value={dealMeta.ticker}
+                style={{ textTransform: "uppercase" }}
+                onChange={(e) => patchDeal("ticker", e.target.value.toUpperCase())}
+              />
+            </DealField>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <button
+              className="btn primary"
+              disabled={!dealMeta.cik.trim()}
+              onClick={() => { /* CIK entered = step advances automatically */ }}
+              style={{ opacity: dealMeta.cik.trim() ? 1 : 0.5 }}
+            >
+              Continue → Upload IC Memo
+            </button>
+            {!dealMeta.cik.trim() && (
+              <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                Enter the SEC CIK to continue
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── STEP 2/3: Upload IC Memo ── */}
       <div
         className="card card-pad"
         style={{
           marginBottom: 20,
-          opacity: !companyReady ? 0.45 : 1,
-          pointerEvents: !companyReady ? "none" : undefined,
+          opacity: uploadBlocked ? 0.45 : 1,
+          pointerEvents: uploadBlocked ? "none" : undefined,
         }}
       >
         <div style={{ marginBottom: 14 }}>
-          <StepBadge n={2} active={step >= 2} />
+          <StepBadge n={isEdgar ? 3 : 2} active={step >= (isEdgar ? 3 : 2)} />
           <span style={{ fontWeight: 600, fontSize: 14, marginLeft: 10 }}>
             Upload IC Memo or Thesis Document
           </span>
@@ -520,10 +784,7 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
 
         <div
           className={`upload-zone${dragOver ? " drag-over" : ""}`}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
           onDragLeave={() => setDragOver(false)}
           onDrop={onDrop}
           onClick={() => !busy && fileInput.current?.click()}
@@ -532,10 +793,7 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
           style={{
             textAlign: "center",
             cursor: busy ? "default" : "pointer",
-            borderStyle: "dashed",
-            borderWidth: 2,
-            borderRadius: 8,
-            padding: "32px 20px",
+            borderStyle: "dashed", borderWidth: 2, borderRadius: 8, padding: "32px 20px",
             borderColor: dragOver ? "var(--accent)" : "var(--border)",
             background: dragOver ? "var(--accent-subtle)" : "var(--bg-muted)",
             transition: "border-color .15s, background .15s",
@@ -555,92 +813,45 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
           {busy ? (
             <>
               <div style={{ fontSize: 28, marginBottom: 10 }}>⏳</div>
-              <div
-                style={{
-                  fontSize: 14,
-                  fontWeight: 600,
-                  color: "var(--text-primary)",
-                }}
-              >
+              <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>
                 Extracting from {uploadName}…
               </div>
-              <div
-                style={{
-                  fontSize: 12.5,
-                  color: "var(--text-secondary)",
-                  marginTop: 4,
-                }}
-              >
+              <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 4 }}>
                 Parsing with Docling · reading milestones with GPT
               </div>
             </>
           ) : (
             <>
-              <div style={{ fontSize: 28, marginBottom: 10, opacity: 0.5 }}>
-                ⬆
-              </div>
-              <div
-                style={{
-                  fontSize: 14,
-                  fontWeight: 600,
-                  color: "var(--text-primary)",
-                }}
-              >
+              <div style={{ fontSize: 28, marginBottom: 10, opacity: 0.5 }}>⬆</div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>
                 Drag & drop an IC memo, or click to browse
               </div>
-              <div
-                style={{
-                  fontSize: 12.5,
-                  color: "var(--text-secondary)",
-                  marginTop: 4,
-                }}
-              >
+              <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 4 }}>
                 PDF, DOCX, PPTX, HTML, Markdown · will be extracted for{" "}
                 <strong>
-                  {resolvedCompanyName ||
-                    (isNewCompany ? "new company (name from document)" : "—")}
+                  {resolvedCompanyName || (isNewCompany ? "new company (name from document)" : "—")}
                 </strong>
               </div>
-              <div
-                style={{
-                  marginTop: 12,
-                  display: "flex",
-                  gap: 6,
-                  justifyContent: "center",
-                  flexWrap: "wrap",
-                }}
-              >
-                {[".PDF", ".DOCX", ".PPTX", ".HTML", ".MD", ".TXT"].map(
-                  (ext) => (
-                    <span
-                      key={ext}
-                      className="mono"
-                      style={{
-                        fontSize: 11,
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        background: "var(--bg-surface)",
-                        border: "1px solid var(--border)",
-                        color: "var(--text-muted)",
-                      }}
-                    >
-                      {ext}
-                    </span>
-                  ),
-                )}
+              <div style={{ marginTop: 12, display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap" }}>
+                {[".PDF", ".DOCX", ".PPTX", ".HTML", ".MD", ".TXT"].map((ext) => (
+                  <span
+                    key={ext}
+                    className="mono"
+                    style={{
+                      fontSize: 11, padding: "2px 8px", borderRadius: 4,
+                      background: "var(--bg-surface)", border: "1px solid var(--border)",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    {ext}
+                  </span>
+                ))}
               </div>
             </>
           )}
         </div>
 
-        <div
-          style={{
-            marginTop: 12,
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-          }}
-        >
+        <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
           <span style={{ fontSize: 12, color: "var(--text-muted)" }}>or</span>
           <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
@@ -654,17 +865,9 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
               disabled={busy || !activeId}
               onClick={run}
             >
-              {busy && uploadName === "sample memo"
-                ? "Loading…"
-                : "Use sample memo (demo)"}
+              {busy && uploadName === "sample memo" ? "Loading…" : "Use sample memo (demo)"}
             </button>
-            <div
-              style={{
-                fontSize: 11.5,
-                color: "var(--text-muted)",
-                marginTop: 6,
-              }}
-            >
+            <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginTop: 6 }}>
               Runs extraction on the pre-loaded demo IC memo for this company
             </div>
           </div>
@@ -674,43 +877,30 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
       {err && (
         <div
           className="card card-pad"
-          style={{
-            color: "var(--red-text)",
-            marginBottom: 20,
-            borderLeft: "3px solid var(--red)",
-          }}
+          style={{ color: "var(--red-text)", marginBottom: 20, borderLeft: "3px solid var(--red)" }}
         >
           {err}
         </div>
       )}
 
-      {/* ── STEP 3: Review & Confirm ── */}
+      {/* ── STEP 3/4: Review & Confirm ── */}
       {result && (
         <div className="card card-pad" style={{ marginBottom: 20 }}>
           <div
             style={{
-              marginBottom: 14,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              flexWrap: "wrap",
-              gap: 10,
+              marginBottom: 14, display: "flex", alignItems: "center",
+              justifyContent: "space-between", flexWrap: "wrap", gap: 10,
             }}
           >
             <div>
-              <StepBadge n={3} active />
+              <StepBadge n={isEdgar ? 4 : 3} active />
               <span style={{ fontWeight: 600, fontSize: 14, marginLeft: 10 }}>
                 Review Candidate Milestones
               </span>
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span
-                className="mono"
-                style={{ fontSize: 12, color: "var(--text-muted)" }}
-              >
-                {result.document_loader === "docling"
-                  ? "Docling"
-                  : result.document_loader}
+              <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {result.document_loader === "docling" ? "Docling" : result.document_loader}
                 {" · "}
                 {result.source_document}
                 {result.model ? ` · ${result.model}` : ""}
@@ -718,38 +908,20 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
             </div>
           </div>
 
-          {/* New investment: show detected company identity and allow editing */}
+          {/* New company: show detected company identity */}
           {isNewCompany && result && (
             <div
               style={{
-                padding: "12px 14px",
-                borderRadius: 8,
-                marginBottom: 16,
-                background: "var(--bg-muted)",
-                border: "1px solid var(--border)",
+                padding: "12px 14px", borderRadius: 8, marginBottom: 16,
+                background: "var(--bg-muted)", border: "1px solid var(--border)",
               }}
             >
               <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>
                 Company identified from document
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  gap: 12,
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                }}
-              >
+              <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <div>
-                  <div
-                    style={{
-                      fontSize: 11,
-                      textTransform: "uppercase",
-                      letterSpacing: ".04em",
-                      color: "var(--text-muted)",
-                      marginBottom: 4,
-                    }}
-                  >
+                  <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--text-muted)", marginBottom: 4 }}>
                     Company name
                   </div>
                   <input
@@ -761,51 +933,66 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
                   />
                 </div>
                 <div>
-                  <div
-                    style={{
-                      fontSize: 11,
-                      textTransform: "uppercase",
-                      letterSpacing: ".04em",
-                      color: "var(--text-muted)",
-                      marginBottom: 4,
-                    }}
-                  >
+                  <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--text-muted)", marginBottom: 4 }}>
                     Company ID
                   </div>
-                  <span
-                    className="mono"
-                    style={{ fontSize: 13, color: "var(--text-secondary)" }}
-                  >
+                  <span className="mono" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
                     {slugify(newCompanyName || result.company_name)}
                   </span>
                 </div>
+                {isEdgar && dealMeta.cik && (
+                  <div>
+                    <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em", color: "var(--text-muted)", marginBottom: 4 }}>
+                      CIK
+                    </div>
+                    <span className="mono" style={{ fontSize: 13, color: "var(--blue-text, #60a5fa)", fontWeight: 600 }}>
+                      {dealMeta.cik}
+                    </span>
+                  </div>
+                )}
               </div>
-              <div
+              <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 8 }}>
+                Edit the name above if needed — this becomes the permanent company ID in the VCP store.
+              </div>
+            </div>
+          )}
+
+          {/* EDGAR context banner — explains what happens on confirm */}
+          {isEdgar && (
+            <div
+              style={{
+                padding: "10px 14px", borderRadius: 8, marginBottom: 16,
+                background: "rgba(59,130,246,0.07)", border: "1px solid rgba(59,130,246,0.2)",
+                fontSize: 13, display: "flex", gap: 10, alignItems: "flex-start",
+              }}
+            >
+              <span
                 style={{
-                  fontSize: 12,
-                  color: "var(--text-muted)",
-                  marginTop: 8,
+                  fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
+                  background: "rgba(59,130,246,0.15)", color: "var(--blue-text, #60a5fa)",
+                  border: "1px solid rgba(59,130,246,0.3)", flexShrink: 0, marginTop: 1,
                 }}
               >
-                Edit the name above if needed — this becomes the permanent
-                company ID in the VCP store.
-              </div>
+                EDGAR
+              </span>
+              <span style={{ color: "var(--text-secondary)" }}>
+                Confirming will lock these milestones <strong>and</strong> automatically pull
+                financial data from SEC EDGAR for CIK <strong className="mono">{dealMeta.cik}</strong>.
+                {dealMeta.sector_key && (
+                  <> Peer benchmarking will use the <strong>{dealMeta.sector_key.replace(/_/g, " ")}</strong> sector.</>
+                )}
+              </span>
             </div>
           )}
 
           {hasExistingVcp && (
             <div
               style={{
-                padding: "10px 14px",
-                borderRadius: 8,
-                marginBottom: 16,
-                background: "var(--amber-bg)",
-                fontSize: 13,
-                color: "var(--amber-text)",
+                padding: "10px 14px", borderRadius: 8, marginBottom: 16,
+                background: "var(--amber-bg)", fontSize: 13, color: "var(--amber-text)",
               }}
             >
-              <strong>Updating existing VCP</strong> — confirming will replace
-              version {confirmed!.version} with {items.length} new milestone(s).
+              <strong>Updating existing VCP</strong> — confirming will replace version {confirmed!.version} with {items.length} new milestone(s).
             </div>
           )}
 
@@ -821,52 +1008,40 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
             ))}
           </div>
 
-          <div
-            style={{
-              marginTop: 16,
-              display: "flex",
-              gap: 10,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
+          <div style={{ marginTop: 16, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <button className="btn" onClick={addBlank}>
               + Add milestone
             </button>
             <button
               className="btn primary"
-              disabled={confirming || !items.length}
+              disabled={confirming || seedingEdgar || !items.length}
               onClick={confirm}
             >
-              {confirming
-                ? "Locking…"
-                : `Confirm & lock VCP (${items.length} milestone${items.length !== 1 ? "s" : ""})`}
+              {seedingEdgar
+                ? "Pulling EDGAR data…"
+                : confirming
+                  ? "Locking VCP…"
+                  : isEdgar
+                    ? `Confirm VCP & pull EDGAR data (${items.length} milestone${items.length !== 1 ? "s" : ""})`
+                    : `Confirm & lock VCP (${items.length} milestone${items.length !== 1 ? "s" : ""})`}
             </button>
             <button
               className="btn"
               style={{ marginLeft: "auto" }}
-              onClick={() => {
-                setResult(null);
-                setItems([]);
-              }}
+              onClick={() => { setResult(null); setItems([]); }}
             >
               Start over
             </button>
           </div>
-          <p
-            style={{
-              marginTop: 10,
-              fontSize: 12.5,
-              color: "var(--text-muted)",
-            }}
-          >
-            Milestones are unconfirmed until you lock them. Locking writes to
-            the VCPStore as audit-logged ground truth.
+          <p style={{ marginTop: 10, fontSize: 12.5, color: "var(--text-muted)" }}>
+            {isEdgar
+              ? "Milestones are unconfirmed until you lock them. Confirming writes to VCPStore and triggers EDGAR ingestion in a single step."
+              : "Milestones are unconfirmed until you lock them. Locking writes to the VCPStore as audit-logged ground truth."}
           </p>
         </div>
       )}
 
-      {/* VCP locked confirmation state (after confirming) */}
+      {/* ── VCP locked confirmation state ── */}
       {!result && confirmed?.confirmed && (
         <div
           className="card card-pad"
@@ -886,29 +1061,76 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
               <span className="chip" key={i}>{metricLabel(m.metric)}</span>
             ))}
           </div>
-          {onGoToIngest && (
+
+          {/* EDGAR ingestion result */}
+          {edgarResult && (
             <div
               style={{
-                borderTop: "1px solid var(--border)",
-                paddingTop: 14,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
+                marginBottom: 16, padding: "12px 14px", borderRadius: 8,
+                background: edgarResult.edgar_ingested ? "rgba(34,197,94,0.07)" : "rgba(245,158,11,0.08)",
+                border: `1px solid ${edgarResult.edgar_ingested ? "rgba(34,197,94,0.25)" : "rgba(245,158,11,0.25)"}`,
               }}
             >
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>
-                  Next step: connect financial data
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-                  Upload a management pack or Excel to start KPI monitoring against this VCP.
-                </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: edgarResult.errors.length > 0 ? 6 : 0 }}>
+                <Badge
+                  status={edgarResult.edgar_ingested ? "Green" : "Amber"}
+                  label="EDGAR"
+                />
+                <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+                  {edgarResult.edgar_ingested
+                    ? `${edgarResult.kpi_periods} financial period${edgarResult.kpi_periods !== 1 ? "s" : ""} ingested from SEC EDGAR`
+                    : edgarResult.deal_metadata_saved
+                      ? "Deal metadata saved · EDGAR pull failed"
+                      : "EDGAR ingestion failed"}
+                </span>
+                {edgarResult.source_quality_status && (
+                  <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    · quality: {edgarResult.source_quality_status}
+                  </span>
+                )}
               </div>
-              <button className="btn primary" onClick={onGoToIngest} style={{ marginLeft: 16, flexShrink: 0 }}>
-                Upload Financials →
-              </button>
+              {edgarResult.errors.length > 0 && (
+                <div style={{ fontSize: 12, color: "var(--amber-text)" }}>
+                  ⚠ {edgarResult.errors[0]}
+                </div>
+              )}
             </div>
           )}
+
+          <div
+            style={{
+              borderTop: "1px solid var(--border)", paddingTop: 14,
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>
+                {edgarResult?.edgar_ingested
+                  ? "Next step: explore the company dashboard"
+                  : "Next step: connect financial data"}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                {edgarResult?.edgar_ingested
+                  ? "EDGAR data is live — view KPI trends, peer benchmarks, and IRR scenarios."
+                  : "Upload a management pack or Excel to start KPI monitoring against this VCP."}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginLeft: 16, flexShrink: 0 }}>
+              {edgarResult?.edgar_ingested && onOpenCompany && (
+                <button
+                  className="btn primary"
+                  onClick={() => onOpenCompany(edgarResult.company_id)}
+                >
+                  View Company →
+                </button>
+              )}
+              {!edgarResult?.edgar_ingested && onGoToIngest && (
+                <button className="btn primary" onClick={onGoToIngest}>
+                  Upload Financials →
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -918,14 +1140,7 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest }: {
 /* ── Step progress bar ── */
 function StepBar({ step, steps }: { step: number; steps: string[] }) {
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 0,
-        marginBottom: 24,
-      }}
-    >
+    <div style={{ display: "flex", alignItems: "center", gap: 0, marginBottom: 24 }}>
       {steps.map((label, i) => {
         const n = i + 1;
         const done = step > n;
@@ -934,28 +1149,17 @@ function StepBar({ step, steps }: { step: number; steps: string[] }) {
           <div
             key={n}
             style={{
-              display: "flex",
-              alignItems: "center",
+              display: "flex", alignItems: "center",
               flex: i < steps.length - 1 ? 1 : undefined,
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <div
                 style={{
-                  width: 24,
-                  height: 24,
-                  borderRadius: "50%",
-                  flexShrink: 0,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  fontSize: 11,
-                  fontWeight: 700,
-                  background: done
-                    ? "var(--green)"
-                    : active
-                      ? "var(--accent)"
-                      : "var(--bg-muted)",
+                  width: 24, height: 24, borderRadius: "50%", flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 11, fontWeight: 700,
+                  background: done ? "var(--green)" : active ? "var(--accent)" : "var(--bg-muted)",
                   color: done || active ? "#fff" : "var(--text-muted)",
                   border: done || active ? "none" : "1px solid var(--border)",
                 }}
@@ -966,11 +1170,7 @@ function StepBar({ step, steps }: { step: number; steps: string[] }) {
                 style={{
                   fontSize: 12.5,
                   fontWeight: active ? 600 : 400,
-                  color: active
-                    ? "var(--text-primary)"
-                    : done
-                      ? "var(--text-secondary)"
-                      : "var(--text-muted)",
+                  color: active ? "var(--text-primary)" : done ? "var(--text-secondary)" : "var(--text-muted)",
                   whiteSpace: "nowrap",
                 }}
               >
@@ -980,9 +1180,7 @@ function StepBar({ step, steps }: { step: number; steps: string[] }) {
             {i < steps.length - 1 && (
               <div
                 style={{
-                  flex: 1,
-                  height: 1,
-                  margin: "0 12px",
+                  flex: 1, height: 1, margin: "0 12px",
                   background: step > n ? "var(--green)" : "var(--border)",
                 }}
               />
@@ -998,14 +1196,9 @@ function StepBadge({ n, active }: { n: number; active: boolean }) {
   return (
     <span
       style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        width: 22,
-        height: 22,
-        borderRadius: "50%",
-        fontSize: 11,
-        fontWeight: 700,
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+        width: 22, height: 22, borderRadius: "50%",
+        fontSize: 11, fontWeight: 700,
         background: active ? "var(--accent)" : "var(--bg-muted)",
         color: active ? "#fff" : "var(--text-muted)",
         verticalAlign: "middle",
@@ -1013,6 +1206,23 @@ function StepBadge({ n, active }: { n: number; active: boolean }) {
     >
       {n}
     </span>
+  );
+}
+
+/* Compact label wrapper for deal economics form fields */
+function DealField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div>
+      <div
+        style={{
+          fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em",
+          color: "var(--text-muted)", marginBottom: 5,
+        }}
+      >
+        {label}
+      </div>
+      {children}
+    </div>
   );
 }
 
@@ -1035,14 +1245,8 @@ function EditableCandidate({
       className={`card card-pad alert-card ${lowConf ? "Amber" : "Green"}`}
       style={lowConf ? { borderLeft: "3px solid var(--amber)" } : undefined}
     >
-      <div
-        className="alert-meta"
-        style={{ display: "flex", gap: 8, alignItems: "center" }}
-      >
-        <Badge
-          status={lowConf ? "Amber" : "Green"}
-          label={lowConf ? "Review" : "Confident"}
-        />
+      <div className="alert-meta" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <Badge status={lowConf ? "Amber" : "Green"} label={lowConf ? "Review" : "Confident"} />
         <input
           className="input"
           style={{ flex: 1, fontWeight: 600 }}
@@ -1052,12 +1256,8 @@ function EditableCandidate({
         />
         <span
           style={{
-            fontSize: 12,
-            fontWeight: 600,
-            padding: "2px 8px",
-            borderRadius: 99,
-            background: lowConf ? "var(--amber)" : "var(--green)",
-            color: "#fff",
+            fontSize: 12, fontWeight: 600, padding: "2px 8px", borderRadius: 99,
+            background: lowConf ? "var(--amber)" : "var(--green)", color: "#fff",
             whiteSpace: "nowrap",
           }}
         >
@@ -1075,17 +1275,11 @@ function EditableCandidate({
 
       <div
         style={{
-          display: "flex",
-          gap: 14,
-          flexWrap: "wrap",
-          margin: "10px 0 4px",
-          alignItems: "flex-end",
+          display: "flex", gap: 14, flexWrap: "wrap", margin: "10px 0 4px", alignItems: "flex-end",
         }}
       >
         <Field label="Metric">
-          <span className="mono" style={{ fontSize: 13 }}>
-            {metricLabel(m.metric)}
-          </span>
+          <span className="mono" style={{ fontSize: 13 }}>{metricLabel(m.metric)}</span>
         </Field>
         <Field label="Target">
           <input
@@ -1093,12 +1287,7 @@ function EditableCandidate({
             style={{ width: 130 }}
             value={m.target_value ?? ""}
             placeholder="—"
-            onChange={(e) =>
-              onPatch(
-                "target_value",
-                e.target.value === "" ? null : Number(e.target.value),
-              )
-            }
+            onChange={(e) => onPatch("target_value", e.target.value === "" ? null : Number(e.target.value))}
           />
         </Field>
         <Field label="Target date">
@@ -1111,10 +1300,7 @@ function EditableCandidate({
           />
         </Field>
         <Field label="Normalized">
-          <span
-            className="mono"
-            style={{ fontSize: 12.5, color: "var(--text-muted)" }}
-          >
+          <span className="mono" style={{ fontSize: 12.5, color: "var(--text-muted)" }}>
             {metricValue(m.metric, m.target_value)} · {shortDate(m.target_date)}
           </span>
         </Field>
@@ -1133,12 +1319,8 @@ function EditableCandidate({
             <blockquote
               className="citation"
               style={{
-                fontStyle: "italic",
-                borderLeft: "2px solid var(--border)",
-                paddingLeft: 10,
-                margin: "8px 0 0",
-                fontSize: 12.5,
-                color: "var(--text-secondary)",
+                fontStyle: "italic", borderLeft: "2px solid var(--border)",
+                paddingLeft: 10, margin: "8px 0 0", fontSize: 12.5, color: "var(--text-secondary)",
               }}
             >
               "{m.source_text}"
@@ -1147,9 +1329,7 @@ function EditableCandidate({
         </div>
       )}
       {note && (
-        <div
-          style={{ fontSize: 12.5, color: "var(--amber-text)", marginTop: 8 }}
-        >
+        <div style={{ fontSize: 12.5, color: "var(--amber-text)", marginTop: 8 }}>
           ⚠ {note}
         </div>
       )}
@@ -1162,11 +1342,8 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
     <div>
       <div
         style={{
-          fontSize: 11,
-          textTransform: "uppercase",
-          letterSpacing: ".04em",
-          color: "var(--text-muted)",
-          marginBottom: 3,
+          fontSize: 11, textTransform: "uppercase", letterSpacing: ".04em",
+          color: "var(--text-muted)", marginBottom: 3,
         }}
       >
         {label}

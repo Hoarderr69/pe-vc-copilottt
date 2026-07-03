@@ -1,9 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON via a temp file + rename so concurrent readers never see a
+    truncated/empty file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, default=str))
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 # Allowed reviewer decisions and how each maps to the queue item status.
@@ -92,7 +108,7 @@ def apply_hitl_decision(
     )
     queue["last_decision_at"] = reviewed_at
 
-    path.write_text(json.dumps(queue, indent=2, default=str), encoding="utf-8")
+    _atomic_write_json(path, queue)
 
     audit_entry = {
         "logged_at": reviewed_at,
@@ -119,7 +135,7 @@ def _append_audit_entry(entry: Dict[str, Any], audit_log_path: str) -> None:
     log_path = Path(audit_log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if log_path.exists():
+    if log_path.exists() and log_path.read_text(encoding="utf-8").strip():
         log = json.loads(log_path.read_text(encoding="utf-8"))
     else:
         log = {"entries": []}
@@ -128,4 +144,4 @@ def _append_audit_entry(entry: Dict[str, Any], audit_log_path: str) -> None:
     log["entry_count"] = len(log["entries"])
     log["updated_at"] = entry["logged_at"]
 
-    log_path.write_text(json.dumps(log, indent=2, default=str), encoding="utf-8")
+    _atomic_write_json(log_path, log)

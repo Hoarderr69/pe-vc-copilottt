@@ -204,7 +204,7 @@ export default function App() {
               {view === "portfolio" && <PortfolioOverviewView data={portfolio} onOpenCompany={openCompany} />}
               {view === "alerts" && hitl && <AlertsView data={hitl} onChanged={loadCore} />}
               {view === "memo" && <MemoView markdown={memo ?? ""} onGenerated={(md) => setMemo(md)} />}
-              {view === "setup" && <SetupView companies={portfolio.companies} onVcpLocked={loadCore} onGoToIngest={() => setView("ingest")} />}
+              {view === "setup" && <SetupView companies={portfolio.companies} onVcpLocked={loadCore} onGoToIngest={() => setView("ingest")} onOpenCompany={openCompany} />}
               {view === "ingest" && <IngestView companies={portfolio.companies} onOpenCompany={openCompany} onFinancialsIngested={loadCore} />}
               {view === "company" && (
                 !company ? <Spinner label="Loading company…" /> : (

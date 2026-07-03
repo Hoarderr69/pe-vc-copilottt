@@ -71,6 +71,8 @@ def build_model_feature_matrix(
         "revenue",
         "operating_income",
         "net_income",
+        "gross_profit",
+        "arr_proxy",
         "ebitda_proxy",
         "working_capital",
         "net_debt",

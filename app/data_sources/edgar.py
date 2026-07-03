@@ -32,6 +32,18 @@ METRIC_TAGS = {
     "net_income": [
         "NetIncomeLoss",
     ],
+    "gross_profit": [
+        "GrossProfit",
+    ],
+    # SaaS/subscription ARR proxies: Remaining Performance Obligation (RPO, post-ASC 606)
+    # and deferred-revenue tags. Not every filer discloses these (RPO is optional under
+    # ASC 606's one-year practical expedient), so this category is sparsely populated for
+    # non-SaaS filers and that's fine — it's an additive proxy, not a required field.
+    "arr_proxy": [
+        "RevenueRemainingPerformanceObligation",
+        "ContractWithCustomerLiabilityCurrent",
+        "DeferredRevenueCurrent",
+    ],
     "cash": [
         "CashAndCashEquivalentsAtCarryingValue",
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",

@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from app.ingestion.quarterly_resample import infer_periods_per_year
+
 DEFAULT_BENCHMARKS = "data/reference/sector_benchmarks.json"
 
 # How far from the sector median counts as "in-line" before we call it out.
@@ -86,18 +88,28 @@ def _company_metrics_from_records(records: List[Dict[str, Any]]) -> Dict[str, Op
     gross_margin = (gross_profit / revenue) if (revenue and gross_profit is not None) else None
 
     # Annualize EBITDA (run-rate) for a leverage multiple consistent with VCP drift.
-    annual_ebitda = ebitda * 12 if ebitda is not None else None
+    # Cadence varies by source (monthly private CSVs vs quarterly EDGAR filings).
+    periods_per_year = infer_periods_per_year(df)
+    annual_ebitda = ebitda * periods_per_year if ebitda is not None else None
     net_debt_to_ebitda = (
         net_debt / annual_ebitda if (net_debt is not None and annual_ebitda not in {None, 0}) else None
     )
 
-    # YoY revenue growth: latest month vs 12 months earlier (needs >=13 records).
+    # YoY revenue growth: latest period vs the record closest to one year earlier,
+    # matched by date rather than row offset so any reporting cadence works.
     revenue_growth_yoy = None
-    if len(df) >= 13:
-        rev_now = _safe_float(df.iloc[-1].get("revenue"))
-        rev_year_ago = _safe_float(df.iloc[-13].get("revenue"))
-        if rev_now is not None and rev_year_ago not in {None, 0}:
-            revenue_growth_yoy = (rev_now / rev_year_ago) - 1
+    rev_now = _safe_float(latest.get("revenue"))
+    if rev_now is not None and len(df) >= 2:
+        year_ago_date = latest["period_end"] - pd.DateOffset(years=1)
+        prior = df.iloc[:-1].copy()
+        prior["_dist_days"] = (prior["period_end"] - year_ago_date).abs().dt.days
+        best = prior.loc[prior["_dist_days"].idxmin()]
+        # Accept only if the match is within half a reporting period of the
+        # true one-year mark — otherwise YoY would silently compare wrong periods.
+        if best["_dist_days"] <= (365 / periods_per_year) / 2:
+            rev_year_ago = _safe_float(best.get("revenue"))
+            if rev_year_ago not in {None, 0}:
+                revenue_growth_yoy = (rev_now / rev_year_ago) - 1
 
     return {
         "revenue_growth_yoy": revenue_growth_yoy,
@@ -143,12 +155,21 @@ def run_peer_benchmark_for_company(
     kpi_records_path: str,
     benchmarks_path: str = DEFAULT_BENCHMARKS,
     output_path: Optional[str] = None,
+    sector_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Benchmark one company's latest metrics against its sector medians."""
+    """Benchmark one company's latest metrics against its sector medians.
+
+    ``sector_key``, when passed, takes priority over the legacy ``company_sector_map``
+    in ``benchmarks_path`` — callers resolve it from the company's own deal metadata
+    (see :func:`app.api.vcp_routes._infer_sector`) so any company with a known sector
+    benchmarks correctly, not just ones hand-registered in the reference file.
+    """
     benchmarks = _load_benchmarks(benchmarks_path)
-    sector_key = benchmarks.get("company_sector_map", {}).get(company_id)
+    sector_key = sector_key or benchmarks.get("company_sector_map", {}).get(company_id)
     if sector_key is None:
         raise ValueError(f"No sector mapping for company '{company_id}' in {benchmarks_path}")
+    if sector_key not in benchmarks.get("sectors", {}):
+        raise ValueError(f"Unknown sector_key '{sector_key}' — not present in {benchmarks_path}")
 
     sector = benchmarks["sectors"][sector_key]
     directions = benchmarks["_metric_direction"]

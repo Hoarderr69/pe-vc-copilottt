@@ -28,7 +28,7 @@ export function VcpTrackerView({ data }: { data: CompanyDetail }) {
       </div>
 
       <div className="citation" style={{ borderTop: "none", marginTop: 0, marginBottom: 18 }}>
-        Source: IC Memo (synthetic) · {data.milestones.length} milestones extracted · confirmed in VCPStore
+        Source: {data.milestones[0]?.source_document || "IC Memo"} · {data.milestones.length} milestones extracted · confirmed in VCPStore
       </div>
 
       {/* Summary bar */}
@@ -109,9 +109,9 @@ export function VcpTrackerView({ data }: { data: CompanyDetail }) {
                     )}
                   </td>
                   <td className="muted" style={{ textTransform: "capitalize", fontSize: 12 }}>{m.category}</td>
-                  <td className="num">{metricValue(m.metric, d?.target_value ?? m.target_value)}</td>
+                  <td className="num">{metricValue(m.metric, d?.target_value ?? m.target_value, data.currency)}</td>
                   <td className="num" style={{ color: isRed ? "var(--red-text)" : isAmber ? "var(--amber-text)" : undefined }}>
-                    {d ? metricValue(m.metric, d.actual_value) : "—"}
+                    {d ? metricValue(m.metric, d.actual_value, data.currency) : "—"}
                   </td>
                   <td><Badge status={d?.status ?? "Not Evaluable"} /></td>
                   <td><InlineProgress m={m} d={d} /></td>

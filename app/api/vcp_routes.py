@@ -15,6 +15,8 @@ import re
 import tempfile
 from datetime import date
 from pathlib import Path
+
+import pandas as pd
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -22,8 +24,10 @@ from pydantic import BaseModel
 
 from app.agents.vcp_extraction_agent import extract_from_document, to_vcp_milestones
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
+from app.ingestion.quarterly_resample import infer_periods_per_year
 from app.llm import azure_openai
 from app.quant.vcp_irr import build_vcp_irr
+from app.store.deal_store import DealStore
 from app.store.vcp_store import VCPStore
 from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision
 from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
@@ -40,6 +44,8 @@ HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 HITL_AUDIT = PROCESSED / "hitl_audit_log.json"
 PORTFOLIO_MEMO = PROCESSED / "portfolio_memo.md"
 SECTOR_BENCHMARKS = PROJECT_ROOT / "data" / "reference" / "sector_benchmarks.json"
+
+PROCESSED.mkdir(parents=True, exist_ok=True)
 
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -64,7 +70,15 @@ def _load_json(path: Path, default: Any = None) -> Any:
         if default is not None:
             return default
         raise HTTPException(status_code=404, detail=f"Not found: {path.name}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        # Concurrent writers (multiple tabs polling the same endpoint) can briefly
+        # observe a truncated file mid-write; treat that as "nothing here yet"
+        # rather than a hard failure.
+        if default is not None:
+            return default
+        raise HTTPException(status_code=404, detail=f"Not found: {path.name}")
+    return json.loads(text)
 
 
 def _worst_status(counts: Dict[str, int]) -> str:
@@ -89,7 +103,18 @@ def _clean_name(stem: str) -> str:
 
 
 def _infer_sector(company_id: str, company_name: str) -> Optional[str]:
-    """Return sector key from sector_benchmarks.json, auto-inferring from name if not mapped."""
+    """Resolve a sector key. Resolution order: deal metadata (set at entry) →
+    sector_benchmarks.json's company_sector_map (legacy/manual overrides) →
+    keyword inference from company name/id → None.
+
+    Any company onboarded with a DealMetadata.sector_key (e.g. via the
+    public-to-private seed script) resolves correctly here with no extra wiring —
+    this is what makes peer benchmarking general beyond hand-registered companies.
+    """
+    deal = DealStore().load(company_id)
+    if deal and deal.sector_key:
+        return deal.sector_key
+
     if not SECTOR_BENCHMARKS.exists():
         return None
     benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
@@ -127,33 +152,74 @@ def _plan_path(
     target: Optional[float],
     target_date_str: Optional[str],
     kpi_periods: List[str],
+    anchor_date_str: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Linear interpolation baseline→target across the KPI period dates."""
-    if baseline is None or target is None or not target_date_str or not kpi_periods:
+    """Linear interpolation baseline→target from the plan anchor to the target date.
+
+    The plan anchors at the deal close date when known — the underwriting plan
+    starts at entry, not at the first period of (possibly pre-deal) KPI history.
+    KPI period dates inside the plan window are kept as plan points so the chart
+    can overlay plan vs actual; the path is then extended on a quarterly grid to
+    the target date so the full plan renders even beyond reported actuals.
+    """
+    if baseline is None or target is None or not target_date_str:
         return []
     try:
         t_end = date.fromisoformat(str(target_date_str)[:10])
-        t_start = date.fromisoformat(str(kpi_periods[0])[:10])
     except ValueError:
         return []
+
+    t_start = None
+    if anchor_date_str:
+        try:
+            t_start = date.fromisoformat(str(anchor_date_str)[:10])
+        except ValueError:
+            t_start = None
+    if t_start is None:
+        if not kpi_periods:
+            return []
+        try:
+            t_start = date.fromisoformat(str(kpi_periods[0])[:10])
+        except ValueError:
+            return []
+
     total_days = (t_end - t_start).days
     if total_days <= 0:
         return []
-    result = []
+
+    plan_dates = {t_start, t_end}
     for p in kpi_periods:
         try:
             p_date = date.fromisoformat(str(p)[:10])
         except ValueError:
             continue
-        if p_date > t_end:
-            break
+        if t_start <= p_date <= t_end:
+            plan_dates.add(p_date)
+    # Quarterly grid so the plan line continues past the latest reported actual.
+    grid = pd.date_range(start=t_start, end=t_end, freq="QE")
+    plan_dates.update(d.date() for d in grid)
+
+    result = []
+    for p_date in sorted(plan_dates):
         frac = (p_date - t_start).days / total_days
-        result.append({"period_end": str(p)[:10], "planned_value": baseline + frac * (target - baseline)})
+        result.append({
+            "period_end": p_date.isoformat(),
+            "planned_value": baseline + frac * (target - baseline),
+        })
     return result
 
 
-def _enrich_milestones(milestones: List[Dict], kpi_periods: List[str]) -> List[Dict]:
+def _enrich_milestones(
+    milestones: List[Dict],
+    kpi_periods: List[str],
+    company_id: Optional[str] = None,
+) -> List[Dict]:
     """Attach a generated plan_path to every milestone that doesn't already have one."""
+    anchor = None
+    if company_id:
+        deal = DealStore().load(company_id)
+        if deal and deal.deal_close_date:
+            anchor = deal.deal_close_date
     out = []
     for m in milestones:
         m = dict(m)
@@ -162,6 +228,7 @@ def _enrich_milestones(milestones: List[Dict], kpi_periods: List[str]) -> List[D
             meta["plan_path"] = _plan_path(
                 m.get("baseline_value"), m.get("target_value"),
                 m.get("target_date"), kpi_periods,
+                anchor_date_str=anchor,
             )
             m["metadata"] = meta
         out.append(m)
@@ -241,6 +308,97 @@ def _action_item(company_id: str, company_name: str, drift: Dict) -> Optional[Di
         "recommended_action": action,
         "evidence": evidence,
     }
+
+
+# ── Equity-at-risk HITL alert injection ─────────────────────────────────────
+
+def _inject_equity_at_risk_alert(
+    company_id: str,
+    kpi_records: List[Dict[str, Any]],
+    nd_ebitda_str: str,
+) -> None:
+    """
+    Push a P1 HITL alert into the review queue when the IRR endpoint detects
+    that the base-case quant projection yields negative exit equity.
+
+    Idempotent: if an equity-at-risk alert for this company already exists in
+    the queue as pending, it is not duplicated.
+    """
+    from datetime import datetime, timezone
+
+    queue_data = _load_json(HITL_QUEUE, default={"queue_items": []})
+    existing = queue_data.get("queue_items", [])
+
+    # Deduplicate: skip if there is already a pending equity-at-risk item for this company.
+    for item in existing:
+        if (
+            item.get("company_id") == company_id
+            and "equity" in item.get("headline", "").lower()
+            and item.get("status") == "pending_review"
+        ):
+            return
+
+    company_name = kpi_records[0].get("company_name", company_id) if kpi_records else company_id
+    now = datetime.now(timezone.utc).isoformat()
+
+    alert = {
+        "review_id": f"review_equity_risk_{company_id}",
+        "created_at": now,
+        "status": "pending_review",
+        "review_action": "immediate_review",
+        "priority_rank": 1,
+        "priority": "P1",
+        "priority_score": 100,
+        "company_id": company_id,
+        "company_name": company_name,
+        "headline": f"CRITICAL: Base-case DCF projects negative equity value at exit — {company_name}",
+        "recommended_action": (
+            "Urgent operating review required. Quant forecast projects that net debt "
+            "exceeds exit EBITDA × entry multiple under the base case. "
+            f"Current Net Debt / Trailing EBITDA: {nd_ebitda_str}. "
+            "Assess refinancing options, covenant headroom, and downside recovery scenarios."
+        ),
+        "primary_risks": [
+            "Equity value wiped at base-case exit",
+            f"Net Debt / Trailing EBITDA: {nd_ebitda_str} — leverage expanding, not compressing",
+            "EBITDA trajectory insufficient to service debt and return equity at entry multiple",
+        ],
+        "red_alert_count": 1,
+        "amber_alert_count": 0,
+        "evidence": [
+            {
+                "metric": "base_case_exit_equity",
+                "signal": "negative",
+                "source": "quant_forecast_irr",
+            }
+        ],
+        "decision": {
+            "decision_status": "not_reviewed",
+            "reviewed_by": None,
+            "reviewed_at": None,
+            "reviewer_note": None,
+            "edited_recommended_action": None,
+        },
+    }
+
+    existing.insert(0, alert)
+    queue_data["queue_items"] = existing
+    queue_data["queue_item_count"] = len(existing)
+    queue_data["pending_review_count"] = sum(
+        1 for i in existing if i.get("status") == "pending_review"
+    )
+
+    import tempfile, os
+    HITL_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(HITL_QUEUE.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            import json as _json
+            f.write(_json.dumps(queue_data, indent=2, default=str))
+        os.replace(tmp, HITL_QUEUE)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 # ── HITL decision fold-back ──────────────────────────────────────────────────
@@ -354,6 +512,8 @@ def get_portfolio_overview() -> Dict[str, Any]:
             "headline": item["headline"] if item else f"{name} is on track.",
             "recommended_action": item["recommended_action"] if item else None,
             "primary_risks": item["primary_risks"] if item else [],
+            "data_source": kpi_records[0].get("source_type", "unknown") if kpi_records else None,
+            "currency": kpi_records[0].get("currency", "GBP") if kpi_records else "GBP",
         })
 
     # Rank action items by score descending
@@ -423,7 +583,7 @@ def get_company_detail(company_id: str) -> Dict[str, Any]:
         }
 
     kpi_periods = [r["period_end"] for r in kpi_records if r.get("period_end")]
-    milestones = _enrich_milestones(milestones, kpi_periods)
+    milestones = _enrich_milestones(milestones, kpi_periods, company_id=company_id)
 
     drift = run_vcp_drift_for_kpi_records(
         company_id=company_id,
@@ -431,6 +591,7 @@ def get_company_detail(company_id: str) -> Dict[str, Any]:
         vcp_store_path=DEFAULT_STORE_PATH,
     )
 
+    periods_per_year = infer_periods_per_year(kpi_records)
     series = []
     for r in kpi_records:
         rev = r.get("revenue")
@@ -442,14 +603,18 @@ def get_company_detail(company_id: str) -> Dict[str, Any]:
             "ebitda": ebitda,
             "ebitda_margin": (ebitda / rev) if (rev and ebitda is not None) else None,
             "net_debt": net_debt,
-            "net_debt_to_ebitda": (net_debt / (ebitda * 12)) if (ebitda and net_debt is not None) else None,
+            "net_debt_to_ebitda": (net_debt / (ebitda * periods_per_year)) if (ebitda and net_debt is not None) else None,
             "cash": r.get("cash"),
         })
 
+    first_rec = kpi_records[0]
     return {
         "company_id": company_id, "company_name": name,
-        "sector": kpi_records[0].get("source_type"),
-        "currency": kpi_records[0].get("currency", "GBP"),
+        "sector": _infer_sector(company_id, name),
+        "data_source": first_rec.get("source_type", "unknown"),
+        "cik": first_rec.get("cik") or None,
+        "currency": first_rec.get("currency", "GBP"),
+        "periods_per_year": periods_per_year,
         "health": _worst_status(drift.get("status_counts", {})),
         "status_counts": drift.get("status_counts", {}),
         "latest_period_end": drift.get("latest_period_end"),
@@ -472,11 +637,24 @@ def get_irr_scenarios(company_id: str) -> Dict[str, Any]:
     if not kpi_records:
         raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}.")
     try:
-        return build_vcp_irr(company_id, kpi_records)
+        result = build_vcp_irr(company_id, kpi_records)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Equity-at-risk: inject a P1 HITL alert so the review queue surfaces this
+    # automatically rather than waiting for the next monitoring run.
+    if result.get("equity_at_risk"):
+        detail = result["equity_at_risk_detail"] or {}
+        nd_str = (
+            f"{detail['nd_ebitda_trailing']}x"
+            if detail.get("nd_ebitda_trailing") is not None
+            else "n/a"
+        )
+        _inject_equity_at_risk_alert(company_id, kpi_records, nd_str)
+
+    return result
 
 
 @router.get("/company/{company_id}/peers")
@@ -488,16 +666,19 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
     if not kpi_path.exists():
         raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
 
-    # Auto-register sector mapping if not already present
     store = VCPStore(DEFAULT_STORE_PATH)
     confirmed = store.load_confirmed_for_company(company_id)
     name = confirmed[0].company_name if confirmed else company_id
     sector = _infer_sector(company_id, name)
     if sector:
+        # Keyword/legacy-inferred sectors get cached into the reference file so future
+        # lookups are instant; deal-metadata-sourced sectors are already persisted there.
         _register_sector(company_id, sector)
 
     try:
-        return run_peer_benchmark_for_company(company_id=company_id, kpi_records_path=str(kpi_path))
+        return run_peer_benchmark_for_company(
+            company_id=company_id, kpi_records_path=str(kpi_path), sector_key=sector
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -535,6 +716,109 @@ def get_audit_log() -> Dict[str, Any]:
     if not HITL_AUDIT.exists():
         return {"entries": [], "entry_count": 0}
     return _load_json(HITL_AUDIT)
+
+
+# ── Company onboarding (deal metadata + optional EDGAR pull) ─────────────────
+
+class SeedCompanyRequest(BaseModel):
+    company_id: str
+    company_name: str
+    cik: Optional[str] = None
+    ticker: Optional[str] = None
+    sector_key: Optional[str] = None
+    deal_close_date: Optional[str] = None
+    entry_ebitda: Optional[float] = None
+    entry_ev_multiple: Optional[float] = None
+    entry_enterprise_value: Optional[float] = None
+    entry_net_debt: Optional[float] = None
+    entry_equity_value: Optional[float] = None
+    holding_period_years: Optional[float] = None
+    fund_vintage: Optional[int] = None
+    ic_target_irr: Optional[float] = None
+    ic_target_moic: Optional[float] = None
+    currency: str = "USD"
+    source_document: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.post("/companies")
+def seed_company(req: SeedCompanyRequest) -> Dict[str, Any]:
+    """Onboard a new portfolio company.
+
+    For private portcos: saves deal metadata only.
+    For public take-privates: saves deal metadata + triggers EDGAR KPI ingestion by CIK.
+
+    This is the backend counterpart to the Setup flow's EDGAR path — the frontend
+    calls this after locking VCP milestones so both happen in one user action.
+    """
+    from app.agents.kpi_extraction_agent import run_kpi_extraction_agent
+    from app.schemas.kpi_schema import KPIExtractionConfig
+    from app.store.deal_store import DealMetadata
+
+    out: Dict[str, Any] = {
+        "company_id": req.company_id,
+        "company_name": req.company_name,
+        "deal_metadata_saved": False,
+        "edgar_ingested": False,
+        "kpi_periods": 0,
+        "source_quality_status": None,
+        "errors": [],
+    }
+
+    # 1. Persist deal metadata
+    deal = DealMetadata(
+        company_id=req.company_id,
+        company_name=req.company_name,
+        deal_close_date=req.deal_close_date,
+        entry_ebitda=req.entry_ebitda,
+        entry_ev_multiple=req.entry_ev_multiple,
+        entry_enterprise_value=req.entry_enterprise_value,
+        entry_net_debt=req.entry_net_debt,
+        entry_equity_value=req.entry_equity_value,
+        holding_period_years=req.holding_period_years,
+        fund_vintage=req.fund_vintage,
+        ic_target_irr=req.ic_target_irr,
+        ic_target_moic=req.ic_target_moic,
+        currency=req.currency,
+        source_document=req.source_document,
+        notes=req.notes,
+        sector_key=req.sector_key,
+    )
+    DealStore().save(deal)
+    out["deal_metadata_saved"] = True
+
+    # 2. Register sector for instant lookup (also covered by DealStore, but belt-and-suspenders)
+    if req.sector_key:
+        _register_sector(req.company_id, req.sector_key)
+
+    # 3. EDGAR ingestion — only when a CIK is provided
+    if req.cik:
+        cid = req.company_id
+        features_dir = PROJECT_ROOT / "data" / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        config = KPIExtractionConfig(
+            company_id=cid,
+            company_name=req.company_name,
+            ticker=req.ticker or "PRIVATE",
+            cik=req.cik.strip(),
+            source_type="edgar",
+            source_path="",
+            base_currency=req.currency,
+            raw_feature_matrix_path=str(features_dir / f"{cid}_raw_feature_matrix.csv"),
+            model_feature_matrix_path=str(features_dir / f"{cid}_model_feature_matrix.csv"),
+            kpi_records_path=str(PROCESSED / f"{cid}_kpi_records.json"),
+            evidence_refs_path=str(PROCESSED / f"{cid}_evidence_refs.json"),
+            source_quality_report_path=str(PROCESSED / f"{cid}_source_quality_report.json"),
+        )
+        try:
+            agent_result = run_kpi_extraction_agent(config)
+            out["edgar_ingested"] = True
+            out["kpi_periods"] = agent_result.get("kpi_records_count", 0)
+            out["source_quality_status"] = agent_result.get("source_quality_report", {}).get("status")
+        except Exception as exc:
+            out["errors"].append(f"EDGAR ingestion failed: {exc}")
+
+    return out
 
 
 # ── VCP extraction & setup ────────────────────────────────────────────────────

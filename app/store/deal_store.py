@@ -28,7 +28,11 @@ DEFAULT_DEAL_DIR = "data/raw/deal_metadata"
 
 
 class DealMetadata(BaseModel):
-    """Deal economics fixed at close — the entry side of every IRR calculation."""
+    """Deal economics fixed at close — the entry side of every IRR calculation.
+
+    All monetary fields are absolute currency units (e.g. 219000000.0 for
+    $219mm), the same scale as KPI records and forecasts. Never millions.
+    """
 
     company_id: str
     company_name: Optional[str] = None
@@ -56,6 +60,10 @@ class DealMetadata(BaseModel):
     currency: str = "GBP"
     source_document: Optional[str] = None
     notes: Optional[str] = None
+    sector_key: Optional[str] = Field(
+        default=None,
+        description="Sector benchmark key (data/reference/sector_benchmarks.json) set at deal entry.",
+    )
 
 
 class DealStore:

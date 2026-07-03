@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, List
 from app.adapters.base import BaseKPIAdapter
+from app.ingestion.quarterly_resample import resample_to_quarterly
 from app.schemas.kpi_schema import (
     EvidenceRef,
     KPIExtractionConfig,
@@ -114,6 +115,18 @@ class PrivatePortcoFinancialAdapter(BaseKPIAdapter):
         model_cols = [col for col in model_cols if col in df.columns]
 
         model_df = df[model_cols].copy()
+        # The quant forecast engine assumes one row == one quarter (seasonal_periods=4,
+        # future dates stepped at freq="QE"). Private portco sources are monthly, so
+        # resample the model matrix to quarterly here. Raw feature matrix and KPI
+        # records below stay monthly — vcp_drift, peer_benchmarking, and the board
+        # pack's EBITDA chart all rely on the native monthly granularity.
+        model_df, was_resampled = resample_to_quarterly(model_df, date_col="period_end")
+        if was_resampled:
+            print(
+                f"[PrivatePortcoFinancialAdapter] Resampled model feature matrix to "
+                f"quarterly cadence ({len(df)} monthly rows -> {len(model_df)} quarterly rows) "
+                f"for {config.company_id}"
+            )
         model_df.to_csv(config.model_feature_matrix_path, index=False)
 
         path = Path(config.source_path)
