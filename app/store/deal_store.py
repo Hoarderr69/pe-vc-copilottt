@@ -38,6 +38,14 @@ class DealMetadata(BaseModel):
     company_name: Optional[str] = None
     deal_close_date: str = Field(description="ISO date the deal closed.")
 
+    # Sector is a first-class company attribute, decided once at ingestion and stored
+    # with the company (see app.store.company_store). Kept here too so a deal file alone
+    # is enough to benchmark a company that has no separate meta sidecar.
+    sector_key: Optional[str] = Field(
+        default=None,
+        description="Resolved sector key (e.g. 'b2b_saas'); aligns with sector_benchmarks.json.",
+    )
+
     # Entry economics (from the IC memo Sources & Uses / Transaction Structure table).
     entry_ebitda: float = Field(description="Entry annual EBITDA at close.")
     entry_ev_multiple: float = Field(description="Entry EV / EBITDA multiple, e.g. 12.0.")

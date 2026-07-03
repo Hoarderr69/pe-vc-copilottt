@@ -23,11 +23,11 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.agents.vcp_extraction_agent import extract_from_document, to_vcp_milestones
+from app.analytics.sector import infer_sector_key
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.ingestion.quarterly_resample import infer_periods_per_year
 from app.llm import azure_openai
 from app.quant.vcp_irr import build_vcp_irr
-from app.store.deal_store import DealStore
 from app.store.vcp_store import VCPStore
 from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision
 from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
@@ -43,7 +43,6 @@ IC_MEMO_DIR = PROJECT_ROOT / "data" / "raw" / "ic_memos"
 HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 HITL_AUDIT = PROCESSED / "hitl_audit_log.json"
 PORTFOLIO_MEMO = PROCESSED / "portfolio_memo.md"
-SECTOR_BENCHMARKS = PROJECT_ROOT / "data" / "reference" / "sector_benchmarks.json"
 
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
@@ -103,18 +102,7 @@ def _clean_name(stem: str) -> str:
 
 
 def _infer_sector(company_id: str, company_name: str) -> Optional[str]:
-    """Resolve a sector key. Resolution order: deal metadata (set at entry) →
-    sector_benchmarks.json's company_sector_map (legacy/manual overrides) →
-    keyword inference from company name/id → None.
-
-    Any company onboarded with a DealMetadata.sector_key (e.g. via the
-    public-to-private seed script) resolves correctly here with no extra wiring —
-    this is what makes peer benchmarking general beyond hand-registered companies.
-    """
-    deal = DealStore().load(company_id)
-    if deal and deal.sector_key:
-        return deal.sector_key
-
+    """Return sector key from sector_benchmarks.json, auto-inferring from name if not mapped."""
     if not SECTOR_BENCHMARKS.exists():
         return None
     benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
@@ -666,13 +654,12 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
     if not kpi_path.exists():
         raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
 
+    # Auto-register sector mapping if not already present
     store = VCPStore(DEFAULT_STORE_PATH)
     confirmed = store.load_confirmed_for_company(company_id)
     name = confirmed[0].company_name if confirmed else company_id
-    sector = _infer_sector(company_id, name)
+    sector = _resolve_company_sector(company_id, name)
     if sector:
-        # Keyword/legacy-inferred sectors get cached into the reference file so future
-        # lookups are instant; deal-metadata-sourced sectors are already persisted there.
         _register_sector(company_id, sector)
 
     try:
@@ -883,6 +870,15 @@ async def run_extraction_from_upload(
 
     resolved_name = (company_name or "").strip() or _clean_name(Path(filename).stem)
     resolved_id = (company_id or "").strip() or _slugify(resolved_name)
+
+    # Decide the company's sector once, here at ingestion, and store it with the company.
+    update_company_meta(
+        resolved_id,
+        base_dir=str(PROCESSED),
+        company_name=resolved_name,
+        sector_key=infer_sector_key(resolved_id, resolved_name),
+        source_type="ic_memo",
+    )
 
     tmp_path: Optional[Path] = None
     try:
