@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  generateReport, getCompany, getHitl, getMemo, getPortfolio,
+  generateReportGraph, getCompany, getHitl, getMemo, getPortfolio, getReportGraphStatus,
   type CompanyDetail, type HitlQueue, type PortfolioOverview, type ReportType, type Status,
 } from "./lib/api";
 import { ErrorState, Spinner } from "./components/ui";
@@ -23,6 +23,7 @@ export default function App() {
   const [companyTab, setCompanyTab] = useState<CompanyTab>("deep");
   const [activeId, setActiveId] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [ingestPreselectId, setIngestPreselectId] = useState<string | undefined>(undefined);
 
   const [portfolio, setPortfolio] = useState<PortfolioOverview | null>(null);
   const [hitl, setHitl] = useState<HitlQueue | null>(null);
@@ -42,17 +43,24 @@ export default function App() {
     error: string;
   } | null>(null);
 
-  // Mirrors backend PROGRESS_STEPS (spec §10) — 8 staged steps.
+  // Mirrors NODE_PROGRESS in app/graph/report_nodes.py — one entry per graph
+  // node, in the order the report graph actually executes them.
   const GEN_STEPS = [
     "Fetching KPI data",
-    "Running forward curve",
+    "Running VCP drift",
+    "Synthesizing alert",
     "Pulling sector benchmarks",
     "Writing executive summary…",
-    "Generating board questions…",
     "Rendering charts",
     "Assembling deck",
     "Report ready",
   ];
+  const GEN_STEP_KEYS = [
+    "fetching_kpis", "running_forecast", "synthesizing_alert", "benchmarking",
+    "generating_narrative", "rendering_charts", "assembling_pptx", "complete",
+  ];
+  const POLL_INTERVAL_MS = 1200;
+  const MAX_POLLS = 300; // ~6 min ceiling before surfacing a timeout error
 
   async function startGenerate(opts: {
     companyId: string; companyName: string; reportType: ReportType;
@@ -60,25 +68,33 @@ export default function App() {
   }) {
     setGenState({ active: true, companyId: opts.companyId, companyName: opts.companyName,
                   reportType: opts.reportType, stepIdx: 0, error: "" });
-    let stepIdx = 0;
-    const interval = setInterval(() => {
-      stepIdx = Math.min(stepIdx + 1, GEN_STEPS.length - 1);
-      setGenState(s => s ? { ...s, stepIdx } : s);
-    }, 2200);
     try {
-      await generateReport({
+      const { thread_id } = await generateReportGraph({
         company_id: opts.companyId,
         report_type: opts.reportType,
         period: opts.period || undefined,
         tone: opts.tone,
         generation_mode: "manual",
       });
-      setGenState(null);
+
+      // Real per-node progress via graph.get_state(), replacing the old
+      // client-side GEN_STEPS timer.
+      for (let poll = 0; poll < MAX_POLLS; poll++) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        const status = await getReportGraphStatus(thread_id);
+        const idx = GEN_STEP_KEYS.indexOf(status.progress_step ?? "");
+        setGenState(s => s ? { ...s, stepIdx: idx >= 0 ? idx : s.stepIdx } : s);
+
+        if (status.status === "complete") { setGenState(null); return; }
+        if (status.status === "failed") {
+          setGenState(s => s ? { ...s, active: false, error: status.error || "Generation failed" } : s);
+          return;
+        }
+      }
+      setGenState(s => s ? { ...s, active: false, error: "Generation timed out" } : s);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Generation failed";
       setGenState(s => s ? { ...s, active: false, error: msg } : s);
-    } finally {
-      clearInterval(interval);
     }
   }
   const [darkMode, setDarkMode] = useState(() => {
@@ -205,7 +221,7 @@ export default function App() {
               {view === "alerts" && hitl && <AlertsView data={hitl} onChanged={loadCore} />}
               {view === "memo" && <MemoView markdown={memo ?? ""} onGenerated={(md) => setMemo(md)} />}
               {view === "setup" && <SetupView companies={portfolio.companies} onVcpLocked={loadCore} onGoToIngest={() => setView("ingest")} onOpenCompany={openCompany} />}
-              {view === "ingest" && <IngestView companies={portfolio.companies} onOpenCompany={openCompany} onFinancialsIngested={loadCore} />}
+              {view === "ingest" && <IngestView companies={portfolio.companies} onOpenCompany={openCompany} onFinancialsIngested={loadCore} initialCompanyId={ingestPreselectId} />}
               {view === "company" && (
                 !company ? <Spinner label="Loading company…" /> : (
                   <>
@@ -214,7 +230,9 @@ export default function App() {
                       <button className={companyTab === "deep" ? "active" : ""} onClick={() => setCompanyTab("deep")}>Deep Dive</button>
                       <button className={companyTab === "vcp" ? "active" : ""} onClick={() => setCompanyTab("vcp")}>VCP Tracker</button>
                     </div>
-                    {companyTab === "deep" ? <CompanyDetailView data={company} /> : <VcpTrackerView data={company} />}
+                    {companyTab === "deep"
+                      ? <CompanyDetailView data={company} onConnectData={() => { setIngestPreselectId(company.company_id); setView("ingest"); }} />
+                      : <VcpTrackerView data={company} />}
                   </>
                 )
               )}

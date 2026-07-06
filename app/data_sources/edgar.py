@@ -32,6 +32,17 @@ METRIC_TAGS = {
     "net_income": [
         "NetIncomeLoss",
     ],
+    # PE add-backs to bridge GAAP operating income to adjusted (non-GAAP) EBITDA —
+    # SBC-heavy issuers can show deeply negative GAAP operating income while their
+    # adjusted EBITDA (the deal's entry-multiple basis) is solidly positive.
+    "stock_based_comp": [
+        "ShareBasedCompensation",
+        "AllocatedShareBasedCompensationExpense",
+    ],
+    "amortization_intangibles": [
+        "AmortizationOfIntangibleAssets",
+        "FiniteLivedIntangibleAssetsAmortizationExpense",
+    ],
     "gross_profit": [
         "GrossProfit",
     ],
@@ -80,6 +91,25 @@ def fetch_company_facts(cik: str) -> Dict:
 
     time.sleep(0.15)
     return response.json()
+
+
+def fetch_company_sic(cik: str) -> Optional[str]:
+    """Return the filer's SIC code, or None.
+
+    The companyfacts payload (``fetch_company_facts``) only carries XBRL facts —
+    SIC lives on the separate, lighter submissions endpoint
+    (https://data.sec.gov/submissions/CIK##########.json), which returns entity
+    metadata (name, tickers, sic, sicDescription) without the full facts tree.
+    """
+    normalized = normalize_cik(cik)
+    url = f"https://data.sec.gov/submissions/CIK{normalized}.json"
+
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    time.sleep(0.15)
+
+    sic = response.json().get("sic")
+    return str(sic).strip() or None if sic else None
 
 
 def _get_usd_facts(company_facts: Dict, tag: str) -> List[Dict]:
@@ -228,6 +258,14 @@ def fetch_kpi_wide(cik: str, limit_quarters: Optional[int] = 60) -> pd.DataFrame
     # For Week 1 demo, operating_income is used as the first operating proxy.
     if "operating_income" in wide.columns and "ebitda_proxy" not in wide.columns:
         wide["ebitda_proxy"] = wide["operating_income"]
+
+    # Adjusted (non-GAAP) EBITDA = GAAP operating income + SBC + amortization of
+    # intangibles. Only computed when at least one add-back is disclosed — this
+    # matches the deal's entry-multiple basis for issuers (e.g. SaaS filers) whose
+    # GAAP operating income is swamped by non-cash SBC expense.
+    addback_cols = [c for c in ["stock_based_comp", "amortization_intangibles"] if c in wide.columns]
+    if "operating_income" in wide.columns and addback_cols:
+        wide["adjusted_ebitda"] = wide["operating_income"] + wide[addback_cols].fillna(0).sum(axis=1)
 
     if limit_quarters:
         wide = wide.tail(limit_quarters)

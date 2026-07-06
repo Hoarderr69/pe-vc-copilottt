@@ -1,6 +1,6 @@
 import type React from "react";
 import type { CompanyOverview, PortfolioOverview } from "../lib/api";
-import { Badge, MetricCard, SectionLabel } from "../components/ui";
+import { Badge, FreshnessBadge, MetricCard, SectionLabel } from "../components/ui";
 import { metricLabel, money, pct, signedPct, bpsAbs } from "../lib/format";
 
 interface Props {
@@ -51,6 +51,11 @@ export function PortfolioOverviewView({ data, onOpenCompany }: Props) {
                   <Badge status={a.priority === "P1" ? "Red" : "Amber"} label={a.priority} />
                   <button className="crumb" style={{ margin: 0, fontWeight: 600, color: "var(--text-primary)" }}
                     onClick={() => onOpenCompany(a.company_id)}>{a.company_name} ›</button>
+                  {a.alert_type === "DATA_SUBMISSION_OVERDUE" && (
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.03em", color: "var(--text-muted)" }}>
+                      DATA SUBMISSION OVERDUE
+                    </span>
+                  )}
                   {(a.review_status === "approved" || a.review_status === "edited") &&
                     <Badge status="Green" label="Reviewed ✓" />}
                 </div>
@@ -100,6 +105,7 @@ function PortfolioCard({ c, onOpen }: { c: CompanyOverview; onOpen: () => void }
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           {c.data_source === "edgar" && <DataSourceBadge />}
+          {c.data_freshness && <FreshnessBadge freshness={c.data_freshness} />}
           <Badge status={c.health} />
         </div>
       </div>

@@ -35,6 +35,29 @@ class VCPDriftResult:
         return asdict(self)
 
 
+# Human-readable names for metric enum keys used in user-facing text.
+METRIC_DISPLAY_NAMES: Dict[str, str] = {
+    "annual_revenue": "Annual Revenue",
+    "ebitda_margin": "EBITDA Margin",
+    "net_debt_to_ebitda": "Net Debt / EBITDA",
+    "sga_ratio": "SG&A Ratio",
+    "gross_margin": "Gross Margin",
+    "revenue_growth": "Revenue Growth (YoY)",
+    "capex_intensity": "CapEx Intensity",
+    "fcf_margin": "FCF Margin",
+    "net_revenue_retention": "Net Revenue Retention",
+    "arr": "Annual Recurring Revenue",
+    "cro_hired": "Chief Revenue Officer Hire",
+    "reporting_cadence_upgrade_complete": "Monthly Reporting Upgrade",
+    "headcount": "Headcount",
+    "churn_rate": "Logo Churn Rate",
+}
+
+
+def metric_display_name(metric: str) -> str:
+    return METRIC_DISPLAY_NAMES.get(metric, metric.replace("_", " ").title())
+
+
 def _safe_float(value: Any) -> Optional[float]:
     try:
         if value is None:
@@ -209,8 +232,8 @@ def evaluate_milestone(
             "status": "Not Evaluable",
             "severity_score": 0,
             "reason": (
-                f"Metric '{metric}' is not currently mapped to financial actuals. "
-                "This may be an operational or organizational milestone."
+                f"{metric_display_name(metric)} does not yet have a mapped financial actual. "
+                "This may be an operational or organisational milestone."
             ),
         }
 
@@ -398,16 +421,23 @@ def run_vcp_drift_for_kpi_records(
     kpi_records_path: str,
     vcp_store_path: str = "data/processed/synthetic_vcp_milestones_seed.json",
     output_path: str | None = None,
+    milestones: Optional[List[VCPMilestone]] = None,
 ) -> Dict[str, Any]:
     """
     Run VCP drift using normalized KPIRecord JSON instead of raw CSV/Excel.
 
     This is the preferred path for downstream architecture:
     adapters normalize raw data, analytical nodes consume normalized records.
+
+    `milestones` lets a caller that already loaded the company's confirmed VCP
+    milestones (e.g. a portfolio loop iterating every company) pass them in,
+    instead of this function opening its own VCPStore and re-fetching the same
+    Postgres row — each fetch is a real network round trip.
     """
 
-    store = VCPStore(vcp_store_path)
-    milestones = store.load_confirmed_for_company(company_id)
+    if milestones is None:
+        store = VCPStore(vcp_store_path)
+        milestones = store.load_confirmed_for_company(company_id)
 
     if not milestones:
         payload = {

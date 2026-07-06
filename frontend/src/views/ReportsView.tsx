@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  listReports, deleteReport,
+  listReports, deleteReport, reportExportUrl,
   type CompanyOverview, type ReportSummary, type ReportType,
 } from "../lib/api";
 import { Badge, Spinner, ErrorState } from "../components/ui";
@@ -178,7 +178,7 @@ export function ReportsView({ companies, onOpenReport, genState, genSteps, onGen
                 <button className="btn" onClick={() => onOpenReport(r.id)}>View</button>
               )}
               {r.has_pdf && (
-                <a href={`http://localhost:8000/api/reports/${r.id}/pdf`} target="_blank" rel="noreferrer"
+                <a href={reportExportUrl(r.id, "pdf")} target="_blank" rel="noreferrer"
                    className="btn" style={{ textDecoration: "none" }}>
                   ↓ PDF{r.status !== "approved" ? " (draft)" : ""}
                 </a>

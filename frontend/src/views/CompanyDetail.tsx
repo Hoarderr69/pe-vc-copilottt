@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { getPeers, getIrrScenarios, type CompanyDetail, type IrrScenarioData, type Milestone, type PeerBenchmark } from "../lib/api";
-import { Badge, MetricCard, SectionLabel } from "../components/ui";
+import { Badge, FreshnessBadge, MetricCard, SectionLabel } from "../components/ui";
 import { ForwardCurveChart, type CurveRow } from "../components/ForwardCurveChart";
-import { bpsAbs, money, mult, pct, signedPct } from "../lib/format";
+import { bpsAbs, fullDate, money, mult, pct, signedPct } from "../lib/format";
 
 type MetricKey = "annual_revenue" | "ebitda_margin" | "net_debt_to_ebitda";
 
@@ -12,7 +12,7 @@ const CHART_META: Record<MetricKey, { label: string; field: keyof CompanyDetail[
   net_debt_to_ebitda: { label: "Net Debt / EBITDA", field: "net_debt_to_ebitda", annualFlow: false },
 };
 
-export function CompanyDetailView({ data }: { data: CompanyDetail }) {
+export function CompanyDetailView({ data, onConnectData }: { data: CompanyDetail; onConnectData?: () => void }) {
   const [metric, setMetric] = useState<MetricKey>("ebitda_margin");
   const driftBy = useMemo(() => new Map(data.drift_results.map((d) => [d.metric, d])), [data]);
   const msBy = useMemo(() => new Map(data.milestones.map((m) => [m.metric, m])), [data]);
@@ -31,6 +31,12 @@ export function CompanyDetailView({ data }: { data: CompanyDetail }) {
   const rev = driftBy.get("annual_revenue");
   const marg = driftBy.get("ebitda_margin");
   const lev = driftBy.get("net_debt_to_ebitda");
+  const freshness = data.data_freshness;
+  // OVERDUE actuals are unreliable — gate the whole analysis. HISTORICAL (e.g.
+  // Qualtrics pre-take-private) is real, finalized data: show it as-is, just
+  // framed by the freshness badge and a context note.
+  const monitoringPaused = freshness?.freshness_status === "overdue";
+  const isHistorical = freshness?.freshness_status === "historical";
 
   const curve = useMemo<CurveRow[]>(() => {
     const meta = CHART_META[metric];
@@ -85,8 +91,25 @@ export function CompanyDetailView({ data }: { data: CompanyDetail }) {
             </div>
           )}
         </div>
-        <Badge status={data.health} />
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {freshness && <FreshnessBadge freshness={freshness} />}
+          <Badge status={data.health} />
+        </div>
       </div>
+
+      {monitoringPaused && freshness && <MonitoringPausedPanel freshness={freshness} onConnectData={onConnectData} />}
+
+      {isHistorical && freshness && (
+        <div
+          className="card section-gap card-pad"
+          style={{ background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.3)" }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4, color: "var(--blue-text, #60a5fa)" }}>
+            Historical Baseline
+          </div>
+          <div className="card-hint">{freshness.message}</div>
+        </div>
+      )}
 
       {/* KPI grid */}
       <div className="grid grid-4">
@@ -103,27 +126,178 @@ export function CompanyDetailView({ data }: { data: CompanyDetail }) {
         <MetricCard label="Cash" value={money(lastCash, cur)} vs={`as of ${data.latest_period_end}`} />
       </div>
 
-      {/* Centrepiece chart */}
-      <div className="card section-gap card-pad">
-        <div className="chart-head">
-          <SectionLabel>Performance vs VCP Plan</SectionLabel>
-          <div className="toggle">
-            {(Object.keys(CHART_META) as MetricKey[]).map((m) => (
-              <button key={m} className={metric === m ? "active" : ""} onClick={() => setMetric(m)}>
-                {CHART_META[m].label}
-              </button>
-            ))}
-          </div>
+      {/* GAAP/non-GAAP basis context: EDGAR actuals vs non-GAAP VCP targets look
+          like massive drift without this explanation. */}
+      {data.data_source === "edgar" && data.basis_mismatch && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            marginTop: 16,
+            padding: "12px 16px",
+            borderRadius: 8,
+            background: "rgba(245,158,11,0.08)",
+            border: "1px solid rgba(245,158,11,0.35)",
+          }}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"
+            style={{ flexShrink: 0, marginTop: 2 }}>
+            <circle cx="8" cy="8" r="7" stroke="rgba(245,158,11,0.9)" strokeWidth="1.5" />
+            <path d="M8 7v4M8 5h.01" stroke="rgba(245,158,11,0.9)" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+          <span style={{ fontSize: 13, lineHeight: 1.5, color: "var(--text-secondary)" }}>
+            Actuals sourced from SEC EDGAR XBRL (GAAP basis, includes stock-based
+            compensation). Last filing: <span className="mono" style={{ color: "var(--text-primary)" }}>{fullDate(data.last_filing_date)}</span>.
+            VCP targets are from the DEFM14C management projections (non-GAAP basis).
+            The margin gap reflects the GAAP/non-GAAP difference, not operational
+            underperformance vs plan.
+          </span>
         </div>
-        <ForwardCurveChart data={curve} target={chartTarget} format={chartFmt[metric]}
-          anomalyIndex={hasDrift ? 12 : null} />
-        <div className="card-hint" style={{ marginTop: 10 }}>
-          Solid actual vs the dashed underwriting plan path. When actual diverges below the plan, value is drifting.
-        </div>
-      </div>
+      )}
 
-      <PeerSection companyId={data.company_id} />
-      <IrrSection companyId={data.company_id} />
+      {!monitoringPaused && (
+        <>
+          {/* Centrepiece chart */}
+          <div className="card section-gap card-pad">
+            <div className="chart-head">
+              <SectionLabel>Performance vs VCP Plan</SectionLabel>
+              <div className="toggle">
+                {(Object.keys(CHART_META) as MetricKey[]).map((m) => (
+                  <button key={m} className={metric === m ? "active" : ""} onClick={() => setMetric(m)}>
+                    {CHART_META[m].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <ForwardCurveChart data={curve} target={chartTarget} format={chartFmt[metric]}
+              anomalyIndex={hasDrift ? 12 : null} />
+            <div className="card-hint" style={{ marginTop: 10 }}>
+              Solid actual vs the dashed underwriting plan path. When actual diverges below the plan, value is drifting.
+            </div>
+          </div>
+
+          <PeerSection companyId={data.company_id} />
+          <QuantSections company={data} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Data freshness gate: drift/IRR analysis is suppressed for OVERDUE (late
+ * submission) companies — a stale-data signal is itself the alert, so it
+ * replaces the analysis rather than running underneath it. There's no live
+ * data-source integration here — the CTA just jumps to the financials
+ * upload flow so the GP (or the portco) can submit the missing period.
+ */
+function MonitoringPausedPanel({ freshness, onConnectData }: {
+  freshness: NonNullable<CompanyDetail["data_freshness"]>;
+  onConnectData?: () => void;
+}) {
+  return (
+    <div
+      className="card section-gap card-pad"
+      style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)" }}
+    >
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6, color: "rgba(239,68,68,0.95)" }}>
+        Monitoring Paused
+      </div>
+      <div className="card-hint" style={{ marginBottom: 10 }}>{freshness.message}</div>
+      <button className="btn primary" onClick={onConnectData} disabled={!onConnectData}>
+        Upload Latest Financials
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Fetches the quant IRR payload once and feeds both quant-driven sections:
+ * the EBITDA forward curve (P10/P50/P90 band) and the IRR scenario matrix.
+ */
+function QuantSections({ company }: { company: CompanyDetail }) {
+  const [irr, setIrr] = useState<IrrScenarioData | null>(null);
+
+  useEffect(() => {
+    setIrr(null);
+    getIrrScenarios(company.company_id).then(setIrr).catch(() => { /* no IRR data — sections stay hidden */ });
+  }, [company.company_id]);
+
+  if (!irr) return null;
+  return (
+    <>
+      <ForecastSection company={company} irr={irr} />
+      <IrrSection data={irr} />
+    </>
+  );
+}
+
+/**
+ * EBITDA forward curve: actual EBITDA history (resampled to quarterly for
+ * monthly reporters, to match the quant engine's quarterly basis) followed by
+ * the ensemble's P50 path inside its P10–P90 confidence band.
+ */
+function ForecastSection({ company, irr }: { company: CompanyDetail; irr: IrrScenarioData }) {
+  const curve = useMemo<CurveRow[]>(() => {
+    const forecast = irr.forecast_quarterly ?? [];
+    if (!forecast.length) return [];
+
+    // Quarterly actual EBITDA. EDGAR data is already quarterly; monthly private
+    // CSVs are summed per calendar quarter (complete quarters only) so actuals
+    // and forecast are on the same flow basis.
+    const monthly = (company.periods_per_year || 12) >= 12;
+    let actuals: Array<{ period_end: string; value: number }>;
+    if (!monthly) {
+      actuals = company.kpi_series
+        .filter((k) => k.ebitda != null)
+        .map((k) => ({ period_end: k.period_end, value: k.ebitda as number }));
+    } else {
+      const byQuarter = new Map<string, { period_end: string; sum: number; n: number }>();
+      company.kpi_series.forEach((k) => {
+        if (k.ebitda == null) return;
+        const d = new Date(k.period_end);
+        const key = `${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3)}`;
+        const q = byQuarter.get(key) ?? { period_end: k.period_end, sum: 0, n: 0 };
+        q.sum += k.ebitda;
+        q.n += 1;
+        if (k.period_end > q.period_end) q.period_end = k.period_end;
+        byQuarter.set(key, q);
+      });
+      actuals = [...byQuarter.values()]
+        .filter((q) => q.n === 3)
+        .map((q) => ({ period_end: q.period_end, value: q.sum }));
+    }
+    actuals.sort((a, b) => a.period_end.localeCompare(b.period_end));
+
+    const last = actuals[actuals.length - 1];
+    return [
+      ...actuals.map((a) => ({ period_end: a.period_end, actual: a.value })),
+      // bridge point so the P50 path and band visually connect to the last actual
+      ...(last ? [{ period_end: last.period_end, actual: last.value, p50: last.value, band: [last.value, last.value] as [number, number] }] : []),
+      ...forecast.slice(0, 8).map((f) => ({
+        period_end: f.period_end,
+        actual: null,
+        p50: f.p50,
+        band: [f.p10, f.p90] as [number, number],
+      })),
+    ];
+  }, [company, irr]);
+
+  if (!curve.length || irr.basis_mismatch) return null;
+  const fmt = (v: number) => money(v, irr.currency);
+
+  return (
+    <div className="card section-gap card-pad">
+      <div className="chart-head">
+        <SectionLabel>EBITDA Forward Curve · P10–P90 Confidence Band</SectionLabel>
+      </div>
+      <ForwardCurveChart data={curve} format={fmt} />
+      <div className="card-hint" style={{ marginTop: 10 }}>
+        Quarterly EBITDA: actuals, then the quant ensemble's P50 path (STL decomposition +
+        SARIMA + Holt-Winters). The shaded band is the P10–P90 model uncertainty range —
+        the same projection that drives the Bear/Base/Bull IRR scenarios below.
+      </div>
     </div>
   );
 }
@@ -223,15 +397,7 @@ function IrrCellContent({ irr }: { irr: number | undefined }) {
   return <>{irr.toFixed(1)}%</>;
 }
 
-function IrrSection({ companyId }: { companyId: string }) {
-  const [data, setData] = useState<IrrScenarioData | null>(null);
-
-  useEffect(() => {
-    setData(null);
-    getIrrScenarios(companyId).then(setData).catch(() => { /* no IRR data — section stays hidden */ });
-  }, [companyId]);
-
-  if (!data) return null;
+function IrrSection({ data }: { data: IrrScenarioData }) {
   const cur = data.currency;
 
   // Forecast-basis mismatch (e.g. GAAP proxy vs adjusted entry EBITDA): the
@@ -400,9 +566,32 @@ function IrrSection({ companyId }: { companyId: string }) {
           ].map((c) => (
             <div key={c.label} style={{ background: "var(--surface)", padding: "12px 14px" }}>
               <div className="card-hint" style={{ marginBottom: 4 }}>{c.label}</div>
-              <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>
-                {c.value != null ? `${c.value.toFixed(1)}%` : "—"}
-              </div>
+              {c.value != null ? (
+                <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>
+                  {c.value.toFixed(1)}%
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
+                  <div className="mono" style={{ fontSize: 18, fontWeight: 600, color: "rgba(239,68,68,0.95)" }}>
+                    —
+                  </div>
+                  <span
+                    style={{
+                      display: "inline-block",
+                      padding: "2px 7px",
+                      borderRadius: 4,
+                      fontSize: 10,
+                      fontWeight: 700,
+                      letterSpacing: "0.04em",
+                      background: "rgba(239,68,68,0.18)",
+                      color: "rgba(239,68,68,0.95)",
+                      border: "1px solid rgba(239,68,68,0.35)",
+                    }}
+                  >
+                    EQUITY AT RISK
+                  </span>
+                </div>
+              )}
               {"gap" in c && c.gap != null && (
                 <div
                   className="mono"

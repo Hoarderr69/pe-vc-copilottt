@@ -19,7 +19,11 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.store.postgres_json_store import PostgresJsonStore
+
 DEFAULT_PROCESSED_DIR = "data/processed"
+
+_store = PostgresJsonStore("company_meta")
 
 
 class CompanyMeta(BaseModel):
@@ -33,26 +37,30 @@ class CompanyMeta(BaseModel):
     sic: Optional[str] = None
 
 
-def _meta_path(company_id: str, base_dir: str = DEFAULT_PROCESSED_DIR) -> Path:
-    return Path(base_dir) / f"{company_id}_company_meta.json"
+def _key(company_id: str, base_dir: str) -> str:
+    """base_dir is folded into the Postgres key (not just company_id) so callers
+    that pass an isolated base_dir — e.g. tests using tmp_path — don't collide
+    with the shared production company_meta collection. Resolved to an absolute
+    path first so "data/processed" (the default) and an equivalent absolute
+    PROCESSED path (as vcp_routes.py passes) land on the same key."""
+    return f"{Path(base_dir).resolve()}/{company_id}_company_meta.json"
 
 
 def load_company_meta(
     company_id: str, base_dir: str = DEFAULT_PROCESSED_DIR
 ) -> Optional[CompanyMeta]:
-    """Load a company's meta sidecar, or ``None`` if it doesn't exist."""
-    path = _meta_path(company_id, base_dir)
-    if not path.exists():
+    """Load a company's meta document, or ``None`` if it doesn't exist."""
+    doc = _store.get(_key(company_id, base_dir))
+    if doc is None:
         return None
-    return CompanyMeta.model_validate_json(path.read_text(encoding="utf-8"))
+    return CompanyMeta.model_validate(doc)
 
 
 def save_company_meta(meta: CompanyMeta, base_dir: str = DEFAULT_PROCESSED_DIR) -> str:
-    """Write (overwrite) a company's meta sidecar. Returns the path written."""
-    path = _meta_path(meta.company_id, base_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(meta.model_dump_json(indent=2), encoding="utf-8")
-    return str(path)
+    """Write (overwrite) a company's meta document. Returns its store key."""
+    key = _key(meta.company_id, base_dir)
+    _store.put(key, meta.model_dump(mode="json"))
+    return key
 
 
 def update_company_meta(

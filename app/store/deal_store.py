@@ -18,11 +18,12 @@ already consumes in ``pe_deal`` mode (``entry_equity_value``,
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from pydantic import BaseModel, Field
+
+from app.store.postgres_json_store import PostgresJsonStore
 
 DEFAULT_DEAL_DIR = "data/raw/deal_metadata"
 
@@ -75,25 +76,34 @@ class DealMetadata(BaseModel):
 
 
 class DealStore:
-    """JSON-backed deal-metadata store, one file per company."""
+    """Deal-metadata store, backed by Postgres (PostgresJsonStore), one document per company."""
 
     def __init__(self, base_dir: str = DEFAULT_DEAL_DIR):
         self.base_dir = Path(base_dir)
-
-    def _path(self, company_id: str) -> Path:
-        return self.base_dir / f"{company_id}.json"
+        self._store = PostgresJsonStore("deals")
 
     def exists(self, company_id: str) -> bool:
-        return self._path(company_id).exists()
+        return self._store.get(company_id) is not None
 
     def load(self, company_id: str) -> Optional[DealMetadata]:
-        path = self._path(company_id)
-        if not path.exists():
+        doc = self._store.get(company_id)
+        if doc is None:
             return None
-        return DealMetadata.model_validate_json(path.read_text(encoding="utf-8"))
+        return DealMetadata.model_validate(doc)
+
+    def load_all(self) -> Dict[str, DealMetadata]:
+        """Fetch every deal in one Postgres round trip, keyed by company_id.
+
+        Callers that need one company at a time in a loop (e.g. the portfolio
+        overview iterating every company) should use this instead of calling
+        `load(cid)` per company — each `get()` is its own network round trip to
+        Azure Postgres, so N calls costs N round trips instead of one.
+        """
+        return {
+            doc["company_id"]: DealMetadata.model_validate(doc)
+            for doc in self._store.list()
+        }
 
     def save(self, deal: DealMetadata) -> str:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        path = self._path(deal.company_id)
-        path.write_text(deal.model_dump_json(indent=2), encoding="utf-8")
-        return str(path)
+        self._store.put(deal.company_id, deal.model_dump(mode="json"))
+        return f"postgres:deals/{deal.company_id}"

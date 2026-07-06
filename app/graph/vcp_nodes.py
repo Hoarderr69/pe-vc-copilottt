@@ -3,8 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
+
+from langgraph.types import interrupt
+
+from app.analytics.action_items import build_action_item
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.store.vcp_store import VCPStore
+from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
+from app.workflows.vcp_confirmation import DEFAULT_STORE_PATH, kpi_records_path
 
 
 class VCPMonitoringState(TypedDict, total=False):
@@ -44,6 +50,7 @@ class VCPMonitoringState(TypedDict, total=False):
 
     alerts: List[Dict[str, Any]]
     hitl_status: str
+    hitl_decision: Dict[str, Any]
     status: str
     errors: List[str]
 
@@ -56,23 +63,22 @@ def initialize_vcp_monitoring_state_node(
 
     Clean path:
     VCPStore + normalized KPI records -> VCP drift -> alerts.
+
+    company_id is a required invoke-time input (no portfolio-wide default) —
+    every path/store lookup below is derived from it via the same helpers the
+    live routes use, so the graph and the HTTP API never disagree on where a
+    company's data lives.
     """
 
-    state.setdefault("company_scope", state.get("company_id", "portco_a_saas"))
-    state.setdefault("company_id", state.get("company_scope", "portco_a_saas"))
+    company_id = state.get("company_id")
+    if not company_id:
+        raise ValueError(
+            "company_id is required to run the VCP monitoring graph."
+        )
 
-    state.setdefault(
-        "vcp_store_path",
-        "data/processed/synthetic_vcp_milestones_seed.json",
-    )
-    state.setdefault(
-        "kpi_records_path",
-        "data/processed/portco_a_saas_kpi_records.json",
-    )
-    state.setdefault(
-        "vcp_drift_scores_path",
-        "data/processed/portco_a_saas_vcp_drift_kpi_graph.json",
-    )
+    state.setdefault("company_scope", company_id)
+    state.setdefault("vcp_store_path", DEFAULT_STORE_PATH)
+    state.setdefault("kpi_records_path", kpi_records_path(company_id))
 
     state.setdefault("alerts", [])
     state.setdefault("errors", [])
@@ -193,7 +199,7 @@ def vcp_drift_from_kpi_records_node(
         company_id=company_id,
         kpi_records_path=kpi_records_path,
         vcp_store_path=state["vcp_store_path"],
-        output_path=state["vcp_drift_scores_path"],
+        output_path=state.get("vcp_drift_scores_path"),
     )
 
     state["vcp_drift_result_count"] = payload["result_count"]
@@ -278,17 +284,61 @@ def route_after_alert_synthesis(
     return "green_skip"
 
 
+def _sync_hitl_review_queue(state: VCPMonitoringState) -> None:
+    """Push this run's alert into the same review queue the live app reads
+    (data/processed/hitl_review_queue.json), via the identical build_action_item
+    -> refresh_hitl_review_queue_from_action_items path the portfolio roll-up
+    uses — so a paused graph run shows up in GET /api/vcp/hitl exactly like a
+    synchronous /api/vcp/portfolio alert does today.
+    """
+    company_id = state.get("company_id") or state.get("company_scope")
+    store = VCPStore(state["vcp_store_path"])
+    confirmed = store.load_confirmed_for_company(company_id) if store.exists() else []
+    company_name = confirmed[0].company_name if confirmed else company_id
+
+    drift = {"results": state.get("vcp_drift_scores", [])}
+    action_item = build_action_item(company_id, company_name, drift)
+    if action_item:
+        refresh_hitl_review_queue_from_action_items([action_item])
+
+
 def hitl_immediate_node(state: VCPMonitoringState) -> VCPMonitoringState:
-    """Red path: flag for immediate operating partner review."""
+    """Red path: pause for immediate operating partner review.
+
+    Blocks here via interrupt() until POST /api/vcp/hitl/decision resumes this
+    thread with the reviewer's decision (see app/api/vcp_routes.py).
+    """
+    _sync_hitl_review_queue(state)
     state["hitl_status"] = "immediate_review_required"
-    state["status"] = "hitl_immediate_pending"
+
+    decision = interrupt({
+        "alert_card": state.get("alert_card"),
+        "severity": state.get("alert_severity"),
+        "company_id": state.get("company_id"),
+    })
+
+    state["hitl_decision"] = decision
+    state["status"] = "hitl_immediate_resolved"
     return state
 
 
 def hitl_digest_node(state: VCPMonitoringState) -> VCPMonitoringState:
-    """Amber path: add to end-of-day HITL digest batch."""
+    """Amber path: pause for the end-of-day HITL digest review.
+
+    Same interrupt/resume mechanics as hitl_immediate_node — only the queue
+    framing (severity) differs; the review UI treats both as pending items.
+    """
+    _sync_hitl_review_queue(state)
     state["hitl_status"] = "digest_review_required"
-    state["status"] = "hitl_digest_pending"
+
+    decision = interrupt({
+        "alert_card": state.get("alert_card"),
+        "severity": state.get("alert_severity"),
+        "company_id": state.get("company_id"),
+    })
+
+    state["hitl_decision"] = decision
+    state["status"] = "hitl_digest_resolved"
     return state
 
 

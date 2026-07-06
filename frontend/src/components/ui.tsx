@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Status } from "../lib/api";
+import type { DataFreshness, Status } from "../lib/api";
 import { statusClass, statusLabel } from "../lib/format";
 
 export function Badge({ status, label }: { status: Status | string; label?: string }) {
@@ -8,6 +8,40 @@ export function Badge({ status, label }: { status: Status | string; label?: stri
     <span className={`badge ${cls}`}>
       <span className="bdot" />
       {label ?? statusLabel(status)}
+    </span>
+  );
+}
+
+const FRESHNESS_LABEL: Record<DataFreshness["freshness_status"], string> = {
+  fresh: "Live",
+  stale: "Stale",
+  overdue: "Data Overdue",
+  awaiting: "Awaiting Data",
+  historical: "Historical Baseline",
+};
+
+const FRESHNESS_COLOR: Record<DataFreshness["freshness_status"], string> = {
+  fresh: "var(--green, #22c55e)",
+  stale: "var(--amber, #f59e0b)",
+  overdue: "var(--red, #ef4444)",
+  awaiting: "var(--text-muted, #6b7280)",
+  historical: "var(--blue-text, #60a5fa)",
+};
+
+/** Badge for the freshness layer — separate from VCP drift health (Red/Amber/Green). */
+export function FreshnessBadge({ freshness, title }: { freshness: DataFreshness; title?: string }) {
+  if (freshness.freshness_status === "fresh") return null;
+  const color = FRESHNESS_COLOR[freshness.freshness_status];
+  return (
+    <span title={title ?? freshness.message} style={{
+      fontSize: 10, fontWeight: 700, letterSpacing: "0.04em",
+      padding: "2px 6px", borderRadius: 4,
+      background: `color-mix(in srgb, ${color} 15%, transparent)`,
+      color, border: `1px solid color-mix(in srgb, ${color} 35%, transparent)`,
+      whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 3,
+    }}>
+      <span style={{ width: 6, height: 6, borderRadius: "50%", background: color, flexShrink: 0 }} />
+      {FRESHNESS_LABEL[freshness.freshness_status].toUpperCase()}
     </span>
   );
 }

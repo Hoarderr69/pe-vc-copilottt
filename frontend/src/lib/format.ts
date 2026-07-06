@@ -45,20 +45,41 @@ export function shortDate(iso: string | null | undefined): string {
   return d.toLocaleDateString("en-GB", { month: "short", year: "2-digit" });
 }
 
+export function fullDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+}
+
 export function dateTime(iso: string | null | undefined): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+export const METRIC_DISPLAY_NAMES: Record<string, string> = {
+  // Financial
+  annual_revenue: "Annual Revenue",
+  ebitda_margin: "EBITDA Margin",
+  net_debt_to_ebitda: "Net Debt / EBITDA",
+  sga_ratio: "SG&A Ratio",
+  gross_margin: "Gross Margin",
+  revenue_growth: "Revenue Growth (YoY)",
+  capex_intensity: "CapEx Intensity",
+  fcf_margin: "FCF Margin",
+  net_revenue_retention: "Net Revenue Retention",
+  arr: "Annual Recurring Revenue",
+
+  // Operational / Organisational
+  cro_hired: "Chief Revenue Officer Hire",
+  reporting_cadence_upgrade_complete: "Monthly Reporting Upgrade",
+  headcount: "Headcount",
+  churn_rate: "Logo Churn Rate",
+};
+
 export function metricLabel(metric: string): string {
-  const map: Record<string, string> = {
-    annual_revenue: "Annual Revenue",
-    ebitda_margin: "EBITDA Margin",
-    net_debt_to_ebitda: "Net Debt / EBITDA",
-    cro_hired: "Chief Revenue Officer Hire",
-    reporting_cadence_upgrade_complete: "Monthly Reporting Upgrade",
-  };
-  return map[metric] || metric;
+  return (
+    METRIC_DISPLAY_NAMES[metric] ??
+    metric.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  );
 }
 
 /** Map a drift Status to the CSS class used by badges/dots (collapses "Not Evaluable"). */

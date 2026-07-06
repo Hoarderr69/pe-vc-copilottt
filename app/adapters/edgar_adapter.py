@@ -42,6 +42,7 @@ class EDGARFeatureMatrixAdapter(BaseKPIAdapter):
         "net_income": "net_income",
         "gross_profit": "gross_profit",
         "ebitda_proxy": "ebitda_proxy",
+        "adjusted_ebitda": "adjusted_ebitda",
         "working_capital": "working_capital",
         "net_debt": "net_debt",
         # ARR proxy (RPO/deferred revenue) has no dedicated KPIRecord field — it still
@@ -124,6 +125,7 @@ class EDGARFeatureMatrixAdapter(BaseKPIAdapter):
                 operating_income=clean_value(row.get("operating_income")),
                 net_income=clean_value(row.get("net_income")),
                 ebitda_proxy=clean_value(row.get("ebitda_proxy")),
+                adjusted_ebitda=clean_value(row.get("adjusted_ebitda")),
                 working_capital=clean_value(row.get("working_capital")),
                 net_debt=clean_value(row.get("net_debt")),
                 source_confidence=0.9,

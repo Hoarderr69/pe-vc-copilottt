@@ -18,26 +18,18 @@ import json
 import shutil
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.agents import alert_synthesis_agent, report_narrative_agent
-from app.analytics.peer_benchmarking import run_peer_benchmark_for_company
-from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
-from app.store.deal_store import DealStore
-from app.quant.vcp_irr import build_vcp_irr
-from app.reports import slide_data_builder
-from app.reports.board_pack_generator import generate_board_pack
 from app.reports.pptx_generator import generate_pptx
-from app.reports.vcp_status_generator import generate_vcp_status_pdf
 from app.store.report_store import ReportRecord, ReportStore
-from app.store.vcp_store import VCPStore
-from app.workflows.vcp_confirmation import DEFAULT_STORE_PATH
+from app.workflows.hitl_decisions import load_audit_entries
 
 # Staged generation progress (mirrors frontend PROGRESS_STEPS in spec §10)
 PROGRESS_STEPS: List[Dict[str, Any]] = [
@@ -60,20 +52,10 @@ HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 _store = ReportStore()
 
-_COMPANY_NAMES: Dict[str, str] = {
-    "portco_a_saas": "Company A",
-    "portco_b_industrial": "Company B",
-    "portco_c_healthcare": "Company C",
-}
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _kpi_records_path(company_id: str) -> Path:
-    return PROCESSED / f"{company_id}_kpi_records.json"
-
 
 def _load_json(path: Path) -> Any:
     if not path.exists():
@@ -225,10 +207,7 @@ def _hitl_decision_for_company(company_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _load_hitl_decisions() -> List[Dict[str, Any]]:
-    data = _load_json(HITL_AUDIT)
-    if not data:
-        return []
-    return data.get("entries", [])[:5]
+    return load_audit_entries(str(HITL_AUDIT), limit=5)
 
 
 def _build_citations(
@@ -295,6 +274,7 @@ class EditSectionRequest(BaseModel):
 @router.get("")
 def list_reports() -> Dict[str, Any]:
     records = _store.list_all()
+    pdf_ids = _store.pdf_ids()
     summaries = []
     for r in records:
         summaries.append({
@@ -309,275 +289,78 @@ def list_reports() -> Dict[str, Any]:
             "alert_severity":   r.alert_severity,
             "generated_at":     r.generated_at,
             "approved_by":      r.approved_by,
-            "has_pdf":          _store.has_pdf(r.id),
+            "has_pdf":          r.id in pdf_ids,
         })
     return {"count": len(summaries), "reports": summaries}
 
 
 # ---------------------------------------------------------------------------
-# POST /api/reports/generate  —  run full generation pipeline
+# POST /api/reports/graph/generate  —  run the full generation pipeline as a
+# checkpointed LangGraph (see app/graph/report_nodes.py — same steps as the
+# synchronous version this replaced, re-sequenced into nodes). Returns immediately;
+# poll /graph/{thread_id}/status for real per-node progress, backed by
+# graph.get_state() rather than the client-side GEN_STEPS timer.
 # ---------------------------------------------------------------------------
 
-@router.post("/generate")
-def generate_report(req: GenerateRequest) -> Dict[str, Any]:
-    company_id   = req.company_id
-    company_name = _COMPANY_NAMES.get(company_id, company_id)
-    report_type  = req.report_type
+@router.post("/graph/generate")
+def generate_report_graph(req: GenerateRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    report_id = str(uuid.uuid4())
+    thread_id = report_id
 
-    # 1. Load milestones from VCP store (confirmed ground truth)
-    vcp_store = VCPStore(DEFAULT_STORE_PATH)
-    confirmed_milestones = vcp_store.load_confirmed_for_company(company_id) if vcp_store.exists() else []
-    if not confirmed_milestones:
-        raise HTTPException(status_code=404, detail=f"No confirmed VCP milestones for {company_id}. Complete Setup first.")
-    milestones = [m.to_dict() for m in confirmed_milestones]
-    company_name = confirmed_milestones[0].company_name or company_name
+    def _run() -> None:
+        from app.graph.report_graph import get_report_graph
 
-    # 2. Load KPI records
-    kpi_path = _kpi_records_path(company_id)
-    if not kpi_path.exists():
-        raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
-    kpi_records_raw: List[Dict[str, Any]] = json.loads(kpi_path.read_text(encoding="utf-8"))
-
-    # Build KPI series (same logic as company detail endpoint)
-    kpi_series = []
-    for r in kpi_records_raw:
-        rev    = r.get("revenue")
-        ebitda = r.get("adjusted_ebitda") or r.get("ebitda_proxy")
-        nd     = r.get("net_debt")
-        margin = (ebitda / rev) if (rev and ebitda is not None) else None
-        lever  = (nd / (ebitda * 12)) if (ebitda and nd is not None) else None
-        kpi_series.append({
-            "period_end":         r.get("period_end"),
-            "revenue":            rev,
-            "ebitda":             ebitda,
-            "ebitda_margin":      margin,
-            "net_debt":           nd,
-            "net_debt_to_ebitda": lever,
-            "cash":               r.get("cash"),
-        })
-
-    # Determine period label
-    period = req.period
-    if not period:
-        latest_end = max((r.get("period_end", "") for r in kpi_records_raw), default="")
-        period = latest_end[:7] if latest_end else "Latest"
-
-    # 3. VCP drift
-    drift = run_vcp_drift_for_kpi_records(
-        company_id=company_id,
-        kpi_records_path=str(kpi_path),
-        vcp_store_path=DEFAULT_STORE_PATH,
-    )
-    drift_results: List[Dict[str, Any]] = drift.get("results", [])
-
-    # 4. Alert synthesis
-    latest_kpi = max(kpi_records_raw, key=lambda r: r.get("period_end", ""), default={})
-    alert_card = alert_synthesis_agent.synthesize(
-        company_id=company_id,
-        company_name=company_name,
-        drift_scores=drift_results,
-        kpi_snapshot=latest_kpi,
-    )
-
-    # HITL gate: honor the operating-partner decision before the alert reaches the
-    # board pack. An edit overrides the AI's recommended lever with the human text;
-    # the rejection itself is already surfaced via the audit trail slide.
-    _hitl_item = _hitl_decision_for_company(company_id)
-    if _hitl_item and _hitl_item.get("status") == "approved_with_edit":
-        _edited = (_hitl_item.get("decision") or {}).get("edited_recommended_action")
-        if _edited:
-            alert_card.recommended_action = _edited
-
-    # 5. Peer benchmarking (best-effort) — resolve sector_key from deal metadata so
-    # any take-private with a DealMetadata.sector_key benchmarks without code changes.
-    peer_benchmark: Optional[Dict[str, Any]] = None
-    try:
-        _deal = DealStore().load(company_id)
-        _sector_key = _deal.sector_key if _deal else None
-        peer_benchmark = run_peer_benchmark_for_company(
-            company_id=company_id,
-            kpi_records_path=str(kpi_path),
-            sector_key=_sector_key,
-        )
-    except Exception:
-        peer_benchmark = None
-
-    # 6. Narrative agent
-    narrative = report_narrative_agent.generate(
-        company_name=company_name,
-        period=period,
-        alert_severity=alert_card.severity,
-        alert_headline=alert_card.headline,
-        alert_root_cause=alert_card.root_cause,
-        alert_recommended_action=alert_card.recommended_action,
-        lever_category=alert_card.lever_category,
-        drift_results=drift_results,
-        milestones=milestones,
-        peer_benchmark=peer_benchmark,
-        irr_at_risk_bps=alert_card.irr_at_risk_bps,
-        tone=req.tone,
-    )
-
-    # 6b. Board questions + structured risks (GPT-4o with offline fallback)
-    board_questions = report_narrative_agent.generate_board_questions(
-        company_name=company_name,
-        period=period,
-        drift_results=drift_results,
-    )
-    risks_output = report_narrative_agent.generate_risks(
-        company_name=company_name,
-        period=period,
-        drift_results=drift_results,
-        alert_recommended_action=alert_card.recommended_action,
-        irr_at_risk_bps=alert_card.irr_at_risk_bps,
-    )
-
-    # 7. Build structured data for in-app viewer + PDF
-    kpi_performance = _build_kpi_performance(drift_results, kpi_series)
-    risks_actions   = _build_risks_actions(alert_card, drift_results)
-    citations       = _build_citations(company_id, peer_benchmark, kpi_records=kpi_records_raw)
-    hitl_decisions  = _load_hitl_decisions()
-
-    # 8. IRR scenarios — live from the quant forecast engine (best-effort; requires
-    # deal metadata + a model feature matrix for the company, same data the
-    # company-deep-dive page's /api/vcp/company/{id}/irr endpoint already uses).
-    irr_data: Optional[Dict[str, Any]] = None
-    try:
-        irr_data = build_vcp_irr(company_id, kpi_records_raw)
-    except Exception:
-        irr_data = None
-    # Legacy list-of-scenario-dict shape, kept for the reportlab PDF + ReportRecord.
-    irr_scenarios: Optional[List[Dict[str, Any]]] = (
-        irr_data["scenario_detail"] if irr_data else None
-    )
-
-    sector = kpi_records_raw[0].get("source_type", "") if kpi_records_raw else ""
-
-    generated_at = datetime.now(timezone.utc).isoformat()
-
-    # 8b. Build fully-structured 10-slide payload
-    slides = slide_data_builder.build_slides(
-        company_id=company_id,
-        company_name=company_name,
-        period=period,
-        sector=sector,
-        milestones=milestones,
-        drift_results=drift_results,
-        kpi_series=kpi_series,
-        alert_card=alert_card.model_dump(),
-        narrative=narrative.model_dump(),
-        peer_benchmark=peer_benchmark,
-        irr_data=irr_data,
-        board_questions=board_questions,
-        risks_output=risks_output.model_dump(),
-        citations=citations,
-        hitl_decisions=hitl_decisions,
-        generated_at=generated_at,
-    )
-
-    # 9. Build report record
-    record = ReportRecord(
-        company_id=company_id,
-        company_name=company_name,
-        report_type=report_type,
-        period=period,
-        sector=sector,
-        tone=req.tone,
-        status="pending_review",
-        generation_mode=req.generation_mode,
-        narrative_mode=narrative.narrative_mode,
-        alert_severity=alert_card.severity,
-        alert_headline=alert_card.headline,
-        alert_root_cause=alert_card.root_cause,
-        alert_recommended_action=alert_card.recommended_action,
-        lever_category=alert_card.lever_category,
-        irr_at_risk_bps=alert_card.irr_at_risk_bps,
-        exec_summary=narrative.exec_summary,
-        key_risks=narrative.key_risks,
-        priority_action=narrative.priority_action,
-        board_talking_points=narrative.board_talking_points,
-        confidence_statement=narrative.confidence_statement,
-        board_questions=board_questions,
-        risks_output=risks_output.model_dump(),
-        slides=slides,
-        progress_step="complete",
-        progress_pct=100,
-        generated_at=generated_at,
-        drift_results=drift_results,
-        milestones=milestones,
-        kpi_records=kpi_records_raw,
-        kpi_performance=kpi_performance,
-        risks_actions=risks_actions,
-        irr_scenarios=irr_scenarios,
-        peer_benchmark=peer_benchmark,
-        citations=citations,
-        hitl_decisions=hitl_decisions,
-    )
-
-    # 10. Generate PDF
-    try:
-        if report_type == "vcp_status_update":
-            pdf_bytes = generate_vcp_status_pdf(
-                company_name=company_name,
-                period=period,
-                milestones=milestones,
-                drift_results=drift_results,
-                priority_action=narrative.priority_action,
-                confidence_statement=narrative.confidence_statement,
+        graph = get_report_graph()
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            graph.invoke(
+                {
+                    "report_id": report_id,
+                    "company_id": req.company_id,
+                    "report_type": req.report_type,
+                    "period": req.period,
+                    "tone": req.tone,
+                    "generation_mode": req.generation_mode,
+                },
+                config=config,
             )
-        else:
-            ebitda_drift = next(
-                (r for r in drift_results if r.get("metric") == "ebitda_margin"), {}
-            )
-            pdf_bytes = generate_board_pack(
-                company_name=company_name,
-                company_id=company_id,
-                period=period,
-                sector=sector,
-                alert_severity=alert_card.severity,
-                alert_headline=alert_card.headline,
-                alert_root_cause=alert_card.root_cause,
-                alert_recommended_action=alert_card.recommended_action,
-                lever_category=alert_card.lever_category,
-                irr_at_risk_bps=alert_card.irr_at_risk_bps,
-                exec_summary=narrative.exec_summary,
-                key_risks=narrative.key_risks,
-                priority_action=narrative.priority_action,
-                board_talking_points=narrative.board_talking_points,
-                confidence_statement=narrative.confidence_statement,
-                narrative_mode=narrative.narrative_mode,
-                synthesis_mode="azure_openai" if alert_card.severity else "offline_rule_based",
-                milestones=milestones,
-                drift_results=drift_results,
-                kpi_performance=kpi_performance,
-                risks_actions=risks_actions,
-                irr_scenarios=irr_scenarios,
-                peer_benchmark=peer_benchmark,
-                kpi_records=kpi_records_raw,
-                citations=citations,
-                hitl_decisions=hitl_decisions,
-            )
-        _store.save_pdf(record.id, pdf_bytes)
-    except Exception as exc:
-        print(f"[ReportRoutes] PDF generation failed: {exc}")
+        except Exception as exc:
+            print(f"[ReportGraph] generation failed for thread {thread_id}: {exc}")
 
-    _store.save(record)
+    background_tasks.add_task(_run)
+
+    return {"report_id": report_id, "thread_id": thread_id, "status": "started"}
+
+
+@router.get("/graph/{thread_id}/status")
+def report_graph_status(thread_id: str) -> Dict[str, Any]:
+    from app.graph.report_graph import get_report_graph
+
+    graph = get_report_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
+
+    if not snapshot or not snapshot.values:
+        raise HTTPException(status_code=404, detail=f"No graph run found for thread {thread_id}")
+
+    error = next((task.error for task in snapshot.tasks if task.error), None)
+    values = snapshot.values
+
+    # NOTE: snapshot.next is not a reliable "is this graph done" signal for a
+    # plain (non-interrupted) linear graph like this one — it's only populated
+    # by LangGraph's interrupt() primitive (which the monitoring graph in
+    # vcp_routes.py uses, but this report graph does not). Completion is
+    # instead derived from progress_step, which persist_report_node sets to
+    # "complete" as its very last state mutation.
+    status = "failed" if error else ("complete" if values.get("progress_step") == "complete" else "running")
 
     return {
-        "id":             record.id,
-        "company_id":     record.company_id,
-        "company_name":   record.company_name,
-        "report_type":    record.report_type,
-        "period":         record.period,
-        "status":         record.status,
-        "narrative_mode": record.narrative_mode,
-        "alert_severity": record.alert_severity,
-        "generated_at":   record.generated_at,
-        "has_pdf":        _store.has_pdf(record.id),
-        "progress_step":  record.progress_step,
-        "progress_pct":   record.progress_pct,
-        "slide_count":    len(record.slides),
-        "slides":         record.slides,
+        "thread_id":      thread_id,
+        "report_id":      values.get("report_id", thread_id),
+        "status":         status,
+        "progress_step":  values.get("progress_step"),
+        "progress_pct":   values.get("progress_pct"),
+        "error":          error,
     }
 
 
@@ -668,7 +451,7 @@ def download_pdf(report_id: str) -> Response:
         raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
     if not _store.has_pdf(report_id):
         raise HTTPException(status_code=404, detail="PDF not yet generated for this report")
-    pdf_bytes = _store.pdf_path(report_id).read_bytes()
+    pdf_bytes = _store.load_pdf(report_id)
     filename = (
         f"{record.company_name}_{record.report_type}_{record.period}.pdf"
         .replace(" ", "_").replace("/", "-")
@@ -761,7 +544,7 @@ def export_pdf(report_id: str) -> Response:
 
     # Fallback: serve the pre-built reportlab board pack when LibreOffice is absent.
     if pdf_bytes is None and _store.has_pdf(report_id):
-        pdf_bytes = _store.pdf_path(report_id).read_bytes()
+        pdf_bytes = _store.load_pdf(report_id)
 
     if pdf_bytes is None:
         raise HTTPException(

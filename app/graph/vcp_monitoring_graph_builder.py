@@ -14,7 +14,7 @@ from app.graph.vcp_nodes import (
 )
 
 
-def build_vcp_monitoring_graph():
+def build_vcp_monitoring_graph(checkpointer=None):
     """
     Build the VCP monitoring graph.
 
@@ -24,10 +24,15 @@ def build_vcp_monitoring_graph():
     -> vcp_drift_from_kpi_records
     -> alert_synthesis         [GPT-4o or offline fallback]
     -> severity_router         [conditional: Red / Amber / Green]
-       -> hitl_immediate       (Red)
-       -> hitl_digest          (Amber)
+       -> hitl_immediate       (Red)  [interrupts — needs checkpointer to resume]
+       -> hitl_digest          (Amber) [interrupts — needs checkpointer to resume]
        -> hitl_skip            (Green)
     -> END
+
+    Pass `checkpointer=` to enable interrupt/resume across HTTP requests (a
+    PostgresSaver in production — see app.graph.checkpointer.get_checkpointer).
+    Without one, hitl_immediate/hitl_digest will raise since LangGraph requires
+    a checkpointer for any graph that calls interrupt().
     """
 
     try:
@@ -76,4 +81,21 @@ def build_vcp_monitoring_graph():
     graph.add_edge("hitl_digest", END)
     graph.add_edge("hitl_skip", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+
+
+_compiled_graph = None
+
+
+def get_vcp_monitoring_graph():
+    """Process-wide compiled graph, built once with the Postgres checkpointer
+    (app.graph.checkpointer.get_checkpointer) so /api/vcp/graph/... routes all
+    share one connection instead of reopening it per request."""
+    global _compiled_graph
+
+    if _compiled_graph is None:
+        from app.graph.checkpointer import get_checkpointer
+
+        _compiled_graph = build_vcp_monitoring_graph(checkpointer=get_checkpointer())
+
+    return _compiled_graph

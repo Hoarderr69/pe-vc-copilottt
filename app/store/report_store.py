@@ -7,13 +7,15 @@ shadow the original AI-generated text without destroying it.
 """
 from __future__ import annotations
 
-import json
+import base64
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+from app.store.postgres_json_store import PostgresJsonStore
 
 
 class ReportRecord(BaseModel):
@@ -83,28 +85,27 @@ DEFAULT_REPORTS_DIR = str(PROJECT_ROOT / "data" / "processed" / "reports")
 
 
 class ReportStore:
-    """Lightweight JSON-backed report store. One JSON file per report, plus an index."""
+    """Report store, backed by Postgres (PostgresJsonStore) — one document per report,
+    plus a companion collection for PDF bytes (base64-encoded, since JSONB holds text)."""
 
     def __init__(self, base_dir: str = DEFAULT_REPORTS_DIR):
         self.base_dir = Path(base_dir)
-        self.index_path = self.base_dir / "index.json"
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._store = PostgresJsonStore("reports")
+        self._pdf_store = PostgresJsonStore("report_pdfs")
 
     # ------------------------------------------------------------------
     # Core CRUD
     # ------------------------------------------------------------------
 
     def save(self, record: ReportRecord) -> None:
-        path = self._record_path(record.id)
-        path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
-        self._rebuild_index()
+        self._store.put(record.id, record.model_dump(mode="json"))
 
     def load(self, report_id: str) -> Optional[ReportRecord]:
-        path = self._record_path(report_id)
-        if not path.exists():
+        doc = self._store.get(report_id)
+        if doc is None:
             return None
         try:
-            return ReportRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            return ReportRecord.model_validate(doc)
         except Exception:
             return None
 
@@ -118,12 +119,11 @@ class ReportStore:
 
     def list_all(self) -> List[ReportRecord]:
         records = []
-        for p in self.base_dir.glob("*.json"):
-            if p.name == "index.json":
+        for doc in self._store.list():
+            try:
+                records.append(ReportRecord.model_validate(doc))
+            except Exception:
                 continue
-            rec = self.load(p.stem)
-            if rec:
-                records.append(rec)
         records.sort(key=lambda r: r.generated_at, reverse=True)
         return records
 
@@ -131,46 +131,24 @@ class ReportStore:
     # PDF storage
     # ------------------------------------------------------------------
 
-    def pdf_path(self, report_id: str) -> Path:
-        return self.base_dir / f"{report_id}.pdf"
-
     def save_pdf(self, report_id: str, pdf_bytes: bytes) -> None:
-        self.pdf_path(report_id).write_bytes(pdf_bytes)
+        self._pdf_store.put(report_id, {"pdf_base64": base64.b64encode(pdf_bytes).decode("ascii")})
+
+    def load_pdf(self, report_id: str) -> Optional[bytes]:
+        doc = self._pdf_store.get(report_id)
+        if doc is None:
+            return None
+        return base64.b64decode(doc["pdf_base64"])
 
     def has_pdf(self, report_id: str) -> bool:
-        return self.pdf_path(report_id).exists()
+        return self._pdf_store.get(report_id) is not None
+
+    def pdf_ids(self) -> set:
+        """All report ids that have a stored PDF, in one round trip — for a
+        caller checking existence across many reports (e.g. the report list
+        endpoint) instead of calling has_pdf() once per report."""
+        return set(self._pdf_store.list_ids())
 
     def delete(self, report_id: str) -> None:
-        self._record_path(report_id).unlink(missing_ok=True)
-        self.pdf_path(report_id).unlink(missing_ok=True)
-        self._rebuild_index()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _record_path(self, report_id: str) -> Path:
-        return self.base_dir / f"{report_id}.json"
-
-    def _rebuild_index(self) -> None:
-        index = []
-        for p in sorted(self.base_dir.glob("*.json")):
-            if p.name == "index.json":
-                continue
-            rec = self.load(p.stem)
-            if rec:
-                index.append({
-                    "id": rec.id,
-                    "company_id": rec.company_id,
-                    "company_name": rec.company_name,
-                    "report_type": rec.report_type,
-                    "period": rec.period,
-                    "status": rec.status,
-                    "generation_mode": rec.generation_mode,
-                    "narrative_mode": rec.narrative_mode,
-                    "generated_at": rec.generated_at,
-                    "approved_by": rec.approved_by,
-                    "alert_severity": rec.alert_severity,
-                })
-        index.sort(key=lambda e: e["generated_at"], reverse=True)
-        self.index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+        self._store.delete(report_id)
+        self._pdf_store.delete(report_id)

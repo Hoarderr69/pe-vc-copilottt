@@ -20,10 +20,11 @@ function useWide(breakpoint = 960) {
 
 import {
   confirmVcp,
+  confirmVcpGraph,
   getConfirmedVcp,
   getExtractStatus,
   runExtraction,
-  runExtractionFromUpload,
+  runExtractionGraphFromUpload,
   seedCompany,
   type CompanyOverview,
   type ConfirmedVcp,
@@ -195,7 +196,7 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest, onOpenCompany 
     setItems([]);
     setUploadName(file.name);
     try {
-      const r = await runExtractionFromUpload(file, {
+      const r = await runExtractionGraphFromUpload(file, {
         companyId: (isNewCompany && !newCompanyName) ? undefined : (resolvedCompanyId || undefined),
         companyName: resolvedCompanyName || undefined,
       });
@@ -254,13 +255,20 @@ export function SetupView({ companies, onVcpLocked, onGoToIngest, onOpenCompany 
     setErr("");
     setEdgarResult(null);
     try {
-      // 1. Lock VCP milestones (always)
-      await confirmVcp(cid, {
+      // 1. Lock VCP milestones (always). Uploads go through the checkpointed
+      // extraction graph (result.thread_id present) and resume that paused
+      // run; the demo-memo path (runExtraction) has no graph run to resume.
+      const confirmPayload = {
         company_name: result?.company_name || resolvedCompanyName,
         reviewed_by: REVIEWER,
         reviewer_note: `Confirmed ${items.length} milestone(s) via Setup review`,
         milestones: items,
-      });
+      };
+      if (result?.thread_id) {
+        await confirmVcpGraph(result.thread_id, confirmPayload);
+      } else {
+        await confirmVcp(cid, confirmPayload);
+      }
 
       // 2. For EDGAR companies: save deal metadata + trigger EDGAR ingestion
       if (isEdgar) {

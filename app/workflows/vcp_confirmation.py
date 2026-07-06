@@ -22,6 +22,13 @@ from app.store.vcp_store import VCPStore
 
 DEFAULT_STORE_PATH = "data/processed/vcp_store.json"
 DEFAULT_CONFIRMATION_LOG = "data/processed/vcp_confirmation_log.json"
+PROCESSED_DIR = "data/processed"
+
+
+def kpi_records_path(company_id: str) -> str:
+    """Canonical per-company KPI records path — the one convention every
+    caller (routes, graph nodes) should derive from instead of hardcoding."""
+    return f"{PROCESSED_DIR}/{company_id}_kpi_records.json"
 
 
 class VCPConfirmationError(ValueError):

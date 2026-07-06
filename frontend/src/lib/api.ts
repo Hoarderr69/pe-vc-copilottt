@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 
 const API_BASE_URL =
   (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000";
@@ -35,6 +34,20 @@ export type Status = "Red" | "Amber" | "Green" | "Not Evaluable";
 
 export interface HeadlineMetric { actual: number | null; target: number | null; gap_pct: number | null; status: Status; }
 
+export type FreshnessStatus = "fresh" | "stale" | "overdue" | "awaiting" | "historical";
+
+export interface DataFreshness {
+  company_id: string;
+  reporting_cadence: string | null;
+  last_data_received: string | null;
+  next_expected: string | null;
+  days_overdue: number;
+  freshness_status: FreshnessStatus;
+  structural_cutoff: boolean;
+  structural_cutoff_reason: string | null;
+  message: string;
+}
+
 export interface CompanyOverview {
   company_id: string;
   company_name: string;
@@ -53,6 +66,7 @@ export interface CompanyOverview {
   review_status: ReviewStatus;
   data_source?: string | null;
   currency?: string;
+  data_freshness?: DataFreshness;
 }
 
 export type ReviewStatus = "none" | "pending" | "approved" | "edited" | "rejected";
@@ -72,6 +86,7 @@ export interface ActionItem {
   review_status: ReviewStatus;
   reviewed_by?: string | null;
   reviewed_at?: string | null;
+  alert_type?: string;
 }
 
 export interface Evidence {
@@ -132,6 +147,8 @@ export interface CompanyDetail {
   company_name: string;
   sector: string | null;
   data_source: string | null;
+  basis_mismatch?: boolean;
+  last_filing_date?: string | null;
   cik: string | null;
   currency: string;
   periods_per_year?: number;
@@ -141,6 +158,7 @@ export interface CompanyDetail {
   milestones: Milestone[];
   drift_results: DriftResult[];
   kpi_series: KpiPoint[];
+  data_freshness?: DataFreshness;
 }
 
 export interface ReviewItem {
@@ -209,6 +227,9 @@ export interface ExtractionResult {
   milestone_count: number;
   needs_review_count: number;
   milestones: ExtractedMilestone[];
+  // Present when extracted via the checkpointed extraction graph
+  // (runExtractionGraphFromUpload) — absent for the demo-memo path (runExtraction).
+  thread_id?: string;
 }
 
 export interface ConfirmResult {
@@ -271,6 +292,13 @@ export interface IrrEquityAtRiskDetail {
   nd_ebitda_trailing: number | null;
 }
 
+export interface ForecastQuarterPoint {
+  period_end: string;
+  p10: number;
+  p50: number;
+  p90: number;
+}
+
 export interface IrrScenarioData {
   company_id: string;
   currency: string;
@@ -282,6 +310,7 @@ export interface IrrScenarioData {
   basis_warning?: string | null;
   equity_at_risk: boolean;
   equity_at_risk_detail: IrrEquityAtRiskDetail | null;
+  forecast_quarterly?: ForecastQuarterPoint[];
 }
 
 async function postForm<T>(path: string, form: FormData): Promise<T> {
@@ -399,7 +428,9 @@ export const getPortfolio = () => get<PortfolioOverview>("/api/vcp/portfolio");
 export const getExtractStatus = () => get<ExtractStatus>("/api/vcp/extract/status");
 export const runExtraction = (companyId: string) =>
   post<ExtractionResult>(`/api/vcp/extract/${companyId}`, {});
-export const runExtractionFromUpload = (
+/** Checkpointed extraction graph (Phase 3/4) — pauses at HITL review, candidates
+ * come back with a thread_id; confirm via confirmVcpGraph to resume the same run. */
+export const runExtractionGraphFromUpload = (
   file: File,
   opts?: { companyId?: string; companyName?: string },
 ) => {
@@ -407,7 +438,7 @@ export const runExtractionFromUpload = (
   form.append("file", file);
   if (opts?.companyId) form.append("company_id", opts.companyId);
   if (opts?.companyName) form.append("company_name", opts.companyName);
-  return postForm<ExtractionResult>("/api/vcp/extract-upload", form);
+  return postForm<ExtractionResult>("/api/vcp/graph/extract-upload", form);
 };
 export const confirmVcp = (companyId: string, payload: {
   company_name?: string;
@@ -415,6 +446,12 @@ export const confirmVcp = (companyId: string, payload: {
   reviewer_note?: string;
   milestones: ExtractedMilestone[];
 }) => post<ConfirmResult>(`/api/vcp/extract/${companyId}/confirm`, payload);
+export const confirmVcpGraph = (threadId: string, payload: {
+  company_name?: string;
+  reviewed_by: string;
+  reviewer_note?: string;
+  milestones: ExtractedMilestone[];
+}) => post<ConfirmResult>(`/api/vcp/graph/${threadId}/confirm`, payload);
 export const getConfirmedVcp = (companyId: string) =>
   get<ConfirmedVcp>(`/api/vcp/store/${companyId}`);
 export const getPeers = (companyId: string) =>
@@ -491,17 +528,6 @@ export interface Slide {
   data: any;
 }
 
-/** Generation progress, polled from GET /api/reports/{id}/status. */
-export interface ReportGenStatus {
-  id: string;
-  status: ReportStatus;
-  progress_step: string;
-  progress_label: string;
-  progress_pct: number;
-  slide_count: number;
-  has_pdf: boolean;
-}
-
 export interface ReportDetail {
   id: string;
   company_id: string;
@@ -549,13 +575,29 @@ export const deleteReport = (id: string) =>
     if (!r.ok) return r.json().then(b => Promise.reject(new Error(b.detail || "Delete failed")));
   });
 
-export const generateReport = (payload: {
+/** Checkpointed report graph (Phase 2/4) — runs in the background; poll
+ * getReportGraphStatus(thread_id) for real per-node progress. */
+export const generateReportGraph = (payload: {
   company_id: string;
   report_type?: ReportType;
   period?: string;
   tone?: string;
   generation_mode?: string;
-}) => post<ReportSummary>("/api/reports/generate", payload);
+}) => post<{ report_id: string; thread_id: string; status: string }>(
+  "/api/reports/graph/generate", payload,
+);
+
+export interface ReportGraphStatus {
+  thread_id: string;
+  report_id: string;
+  status: "running" | "complete" | "failed";
+  progress_step: string | null;
+  progress_pct: number | null;
+  error: string | null;
+}
+
+export const getReportGraphStatus = (threadId: string) =>
+  get<ReportGraphStatus>(`/api/reports/graph/${threadId}/status`);
 
 export const getReport = (id: string) =>
   get<ReportDetail>(`/api/reports/${id}`);
@@ -574,42 +616,3 @@ export const editReportSection = (id: string, section_key: string, content: stri
     body: JSON.stringify({ section_key, content }),
   }).then(r => r.json());
 
-export const getReportStatus = (id: string) =>
-  get<ReportGenStatus>(`/api/reports/${id}/status`);
-
-/* ---------- Progress polling hook ---------- */
-
-/**
- * Poll GET /api/reports/{id}/status every `intervalMs` until generation
- * completes (status leaves "draft"/progress reaches 100). Returns the latest
- * status snapshot, or null before the first response. Pass `null` to disable.
- */
-export function useReportStatus(
-  reportId: string | null,
-  opts: { intervalMs?: number; enabled?: boolean } = {},
-): ReportGenStatus | null {
-  const { intervalMs = 2000, enabled = true } = opts;
-  const [status, setStatus] = useState<ReportGenStatus | null>(null);
-
-  useEffect(() => {
-    if (!reportId || !enabled) { setStatus(null); return; }
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-
-    async function tick() {
-      try {
-        const s = await getReportStatus(reportId!);
-        if (cancelled) return;
-        setStatus(s);
-        if (s.progress_pct >= 100 || s.status !== "draft") return; // done
-      } catch {
-        /* keep polling through transient errors */
-      }
-      if (!cancelled) timer = setTimeout(tick, intervalMs);
-    }
-    tick();
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [reportId, intervalMs, enabled]);
-
-  return status;
-}

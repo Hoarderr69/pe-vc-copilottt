@@ -74,6 +74,7 @@ def build_model_feature_matrix(
         "gross_profit",
         "arr_proxy",
         "ebitda_proxy",
+        "adjusted_ebitda",
         "working_capital",
         "net_debt",
         "fed_funds_rate",

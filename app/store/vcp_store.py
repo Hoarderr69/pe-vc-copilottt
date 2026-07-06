@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.schemas.vcp_schema import VCPMilestone
+from app.store.postgres_json_store import PostgresJsonStore
 
 
 class VCPStore:
     """
-    Lightweight JSON-backed VCP store for prototype.
+    VCP milestone store, backed by Postgres (PostgresJsonStore).
 
-    In production, this becomes Postgres.
-    For now, it reads/writes confirmed VCP milestones from JSON.
+    `path` is kept as the store's identity key (it was the JSON file path
+    before this moved to Postgres) so every caller that already shares the
+    same DEFAULT_STORE_PATH constant continues to read/write the same
+    underlying document.
     """
 
     def __init__(
@@ -20,18 +22,32 @@ class VCPStore:
         path: str = "data/processed/synthetic_vcp_milestones_seed.json",
     ):
         self.path = Path(path)
+        self._store = PostgresJsonStore("vcp_milestones")
+        self._cache: Optional[List[VCPMilestone]] = None
 
     def exists(self) -> bool:
-        return self.path.exists()
+        return self._store.get(str(self.path)) is not None
 
     def load_all(self) -> List[VCPMilestone]:
-        if not self.path.exists():
-            return []
+        """Fetches the full milestones document once per instance and reuses it.
 
-        with open(self.path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        Every callback (load_for_company/load_confirmed_for_company/company_ids/
+        is_confirmed) goes through this, and callers like the portfolio route
+        reuse one VCPStore instance across an entire company loop — caching here
+        turns what used to be one Postgres round trip per call into one per
+        instance (each round trip to Azure Postgres costs real network latency,
+        so this matters a lot on hot paths iterating many companies).
+        """
+        if self._cache is not None:
+            return self._cache
 
-        return [VCPMilestone.from_dict(item) for item in payload]
+        doc = self._store.get(str(self.path))
+        if not doc:
+            self._cache = []
+        else:
+            self._cache = [VCPMilestone.from_dict(item) for item in doc.get("milestones", [])]
+
+        return self._cache
 
     def load_for_company(self, company_id: str) -> List[VCPMilestone]:
         return [
@@ -82,12 +98,9 @@ class VCPStore:
         milestones: List[VCPMilestone],
         output_path: Optional[str] = None,
     ) -> str:
-        save_path = Path(output_path) if output_path else self.path
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        key = str(Path(output_path)) if output_path else str(self.path)
+        self._store.put(key, {"milestones": [m.to_dict() for m in milestones]})
+        if key == str(self.path):
+            self._cache = None
 
-        payload = [milestone.to_dict() for milestone in milestones]
-
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, default=str)
-
-        return str(save_path)
+        return key

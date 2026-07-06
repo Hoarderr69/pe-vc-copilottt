@@ -23,18 +23,28 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.agents.vcp_extraction_agent import extract_from_document, to_vcp_milestones
+from app.analytics.action_items import build_action_item
+from app.analytics.data_freshness import FreshnessStatus, compute_freshness
 from app.analytics.sector import infer_sector_key
+from app.data_sources.edgar import fetch_company_sic
 from app.analytics.vcp_drift import run_vcp_drift_for_kpi_records
 from app.ingestion.quarterly_resample import infer_periods_per_year
 from app.llm import azure_openai
 from app.quant.vcp_irr import build_vcp_irr
+from app.store.company_store import load_company_meta, update_company_meta
+from app.store.deal_store import DealStore
 from app.store.vcp_store import VCPStore
-from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision
-from app.workflows.hitl_queue import refresh_hitl_review_queue_from_action_items
+from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision, load_audit_entries
+from app.workflows.hitl_queue import (
+    load_hitl_queue,
+    refresh_hitl_review_queue_from_action_items,
+    save_hitl_queue,
+)
 from app.workflows.vcp_confirmation import (
     DEFAULT_STORE_PATH,
     VCPConfirmationError,
     confirm_vcp_milestones,
+    kpi_records_path,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,13 +58,17 @@ PROCESSED.mkdir(parents=True, exist_ok=True)
 
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
+# Sentinel distinguishing "caller didn't pass a preloaded deal" from "caller
+# passed deal=None because there truly is no deal record for this company."
+_UNSET = object()
+
 router = APIRouter(prefix="/api/vcp", tags=["vcp"])
 
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 
 def _kpi_records_path(company_id: str) -> Path:
-    return PROCESSED / f"{company_id}_kpi_records.json"
+    return PROJECT_ROOT / kpi_records_path(company_id)
 
 
 def _load_kpi(company_id: str) -> List[Dict]:
@@ -101,30 +115,34 @@ def _clean_name(stem: str) -> str:
     return " ".join(w.capitalize() for w in re.split(r"[_\-\s]+", cleaned) if w)
 
 
-def _infer_sector(company_id: str, company_name: str) -> Optional[str]:
-    """Return sector key from sector_benchmarks.json, auto-inferring from name if not mapped."""
-    if not SECTOR_BENCHMARKS.exists():
-        return None
-    benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
-    sector_map = benchmarks.get("company_sector_map", {})
+SECTOR_BENCHMARKS = PROJECT_ROOT / "data" / "reference" / "sector_benchmarks.json"
 
-    # Exact match first
-    if company_id in sector_map:
-        return sector_map[company_id]
 
-    # Keyword inference from company name/id
-    text = (company_id + " " + company_name).lower()
-    if any(k in text for k in ("saas", "software", "tech")):
-        return "b2b_saas"
-    if any(k in text for k in ("industrial", "manufacturing", "factory")):
-        return "industrial_manufacturing"
-    if any(k in text for k in ("health", "care", "medical", "pharma")):
-        return "healthcare_services"
-    return None
+def _infer_sector(
+    company_id: str,
+    company_name: str,
+    deal: Optional[Any] = _UNSET,
+) -> Optional[str]:
+    """Resolve sector key. Resolution order:
+    1. company_meta sidecar (written at ingestion/onboarding — canonical new path)
+    2. DealStore (backward-compat for existing deal JSON files, e.g. qualtrics.json)
+    3. infer_sector_key() from app.analytics.sector (SIC map → keyword inference)
+
+    `deal` lets a caller that already loaded the company's DealMetadata pass it
+    in, instead of this function re-fetching the same Postgres row.
+    """
+    meta = load_company_meta(company_id, base_dir=str(PROCESSED))
+    if meta and meta.sector_key:
+        return meta.sector_key
+    if deal is _UNSET:
+        deal = DealStore().load(company_id)
+    if deal and deal.sector_key:
+        return deal.sector_key
+    return infer_sector_key(company_id, company_name, sic_code=meta.sic if meta else None)
 
 
 def _register_sector(company_id: str, sector_key: str) -> None:
-    """Persist a new company→sector mapping so future lookups are instant."""
+    """Persist to sector_benchmarks.json company_sector_map (legacy belt-and-suspenders)."""
     if not SECTOR_BENCHMARKS.exists():
         return
     benchmarks = json.loads(SECTOR_BENCHMARKS.read_text(encoding="utf-8"))
@@ -201,11 +219,17 @@ def _enrich_milestones(
     milestones: List[Dict],
     kpi_periods: List[str],
     company_id: Optional[str] = None,
+    deal: Optional[Any] = _UNSET,
 ) -> List[Dict]:
-    """Attach a generated plan_path to every milestone that doesn't already have one."""
+    """Attach a generated plan_path to every milestone that doesn't already have one.
+
+    `deal` lets a caller that already loaded the company's DealMetadata pass it
+    in, instead of this function re-fetching the same Postgres row.
+    """
     anchor = None
     if company_id:
-        deal = DealStore().load(company_id)
+        if deal is _UNSET:
+            deal = DealStore().load(company_id)
         if deal and deal.deal_close_date:
             anchor = deal.deal_close_date
     out = []
@@ -221,81 +245,6 @@ def _enrich_milestones(
             m["metadata"] = meta
         out.append(m)
     return out
-
-
-# ── Action item scoring (inline — no pre-generated file needed) ───────────────
-
-_METRIC_WEIGHTS = {"net_debt_to_ebitda": 5, "ebitda_margin": 4, "annual_revenue": 3}
-_SEVERITY_WEIGHTS = {"Red": 10, "Amber": 5, "Green": 0}
-
-
-def _action_item(company_id: str, company_name: str, drift: Dict) -> Optional[Dict]:
-    # Build from drift results — each result is a metric-level assessment
-    results = [r for r in drift.get("results", []) if r.get("status") in ("Red", "Amber", "Green")]
-    if not results:
-        return None
-    red = [r for r in results if r.get("status") == "Red"]
-    amber = [r for r in results if r.get("status") == "Amber"]
-    if not red and not amber:
-        return None  # all green — no action item needed
-    metrics = sorted({r.get("metric") for r in results if r.get("metric") and r.get("status") in ("Red", "Amber")})
-    score = sum(_SEVERITY_WEIGHTS.get(r.get("status", ""), 0) + _METRIC_WEIGHTS.get(r.get("metric", ""), 1) for r in red + amber)
-
-    if len(red) >= 2 or score >= 25:
-        priority = "P1"
-    elif len(red) == 1 or score >= 12:
-        priority = "P2"
-    else:
-        priority = "P3"
-
-    metric_set = set(metrics)
-    if "net_debt_to_ebitda" in metric_set and "ebitda_margin" in metric_set:
-        action = "Review leverage headroom, cash generation, SG&A actions, and EBITDA recovery plan with CFO."
-    elif "ebitda_margin" in metric_set and "annual_revenue" in metric_set:
-        action = "Review revenue execution, pricing discipline, and cost base with CEO/CFO."
-    elif "annual_revenue" in metric_set:
-        action = "Review pipeline quality, sales execution, pricing, and customer retention plan."
-    elif "ebitda_margin" in metric_set:
-        action = "Review gross margin, SG&A run-rate, hiring pace, and discretionary spend."
-    elif "net_debt_to_ebitda" in metric_set:
-        action = "Review debt headroom, free cash flow, cash sweep assumptions, and liquidity risk."
-    else:
-        action = "Review underlying VCP milestone drift and assign owner follow-up."
-
-    if len(red) >= 2:
-        headline = f"{company_name} requires immediate attention: multiple VCP metrics are Red ({', '.join(metrics)})."
-    elif len(red) == 1:
-        headline = f"{company_name} has one Red VCP drift item requiring follow-up ({', '.join(metrics)})."
-    elif amber:
-        headline = f"{company_name} has Amber VCP drift requiring monitoring ({', '.join(metrics)})."
-    else:
-        headline = f"{company_name} is currently on track across evaluated VCP metrics."
-
-    # Cite the underlying Red/Amber drift results as evidence (metric + source).
-    evidence = [
-        {
-            "metric": r.get("metric"),
-            "severity": r.get("status"),
-            "summary": r.get("reason"),
-            "source_path": r.get("source_path"),
-            "source_column": r.get("source_column"),
-        }
-        for r in sorted(red + amber, key=lambda r: 0 if r.get("status") == "Red" else 1)
-    ]
-
-    return {
-        "company_id": company_id,
-        "company_name": company_name,
-        "priority_score": score,
-        "priority": priority,
-        "red_alert_count": len(red),
-        "amber_alert_count": len(amber),
-        "alert_count": len(red) + len(amber),
-        "primary_risks": metrics,
-        "headline": headline,
-        "recommended_action": action,
-        "evidence": evidence,
-    }
 
 
 # ── Equity-at-risk HITL alert injection ─────────────────────────────────────
@@ -314,7 +263,7 @@ def _inject_equity_at_risk_alert(
     """
     from datetime import datetime, timezone
 
-    queue_data = _load_json(HITL_QUEUE, default={"queue_items": []})
+    queue_data = load_hitl_queue(str(HITL_QUEUE), default={"queue_items": []})
     existing = queue_data.get("queue_items", [])
 
     # Deduplicate: skip if there is already a pending equity-at-risk item for this company.
@@ -376,17 +325,7 @@ def _inject_equity_at_risk_alert(
         1 for i in existing if i.get("status") == "pending_review"
     )
 
-    import tempfile, os
-    HITL_QUEUE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(HITL_QUEUE.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            import json as _json
-            f.write(_json.dumps(queue_data, indent=2, default=str))
-        os.replace(tmp, HITL_QUEUE)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    save_hitl_queue(queue_data, str(HITL_QUEUE))
 
 
 # ── HITL decision fold-back ──────────────────────────────────────────────────
@@ -402,7 +341,7 @@ _STATUS_TO_REVIEW = {
 
 def _hitl_decision_map() -> Dict[str, Dict[str, Any]]:
     """Map company_id → its current HITL decision, read from the review queue."""
-    queue = _load_json(HITL_QUEUE, default={"queue_items": []})
+    queue = load_hitl_queue(str(HITL_QUEUE), default={"queue_items": []})
     out: Dict[str, Dict[str, Any]] = {}
     for q in queue.get("queue_items", []):
         cid = q.get("company_id")
@@ -443,6 +382,7 @@ def get_portfolio_overview() -> Dict[str, Any]:
 
     companies = []
     action_items = []
+    deals_by_id = DealStore().load_all()
 
     for cid in store.company_ids():
         confirmed = store.load_confirmed_for_company(cid)
@@ -451,6 +391,8 @@ def get_portfolio_overview() -> Dict[str, Any]:
 
         name = confirmed[0].company_name or cid
         kpi_records = _load_kpi(cid)
+        deal = deals_by_id.get(cid)
+        freshness = compute_freshness(cid, kpi_records, deal.deal_close_date if deal else None)
 
         if not kpi_records:
             # VCP locked but no financials yet
@@ -462,6 +404,40 @@ def get_portfolio_overview() -> Dict[str, Any]:
                 "hitl_status": "vcp_confirmed", "priority": None, "priority_rank": None,
                 "headline": f"VCP locked — {len(confirmed)} milestone(s). Upload financials to begin monitoring.",
                 "recommended_action": None, "primary_risks": [],
+                "data_freshness": freshness.model_dump(),
+            })
+            continue
+
+        # OVERDUE data is itself the signal: suppress drift/IRR analysis on stale
+        # actuals (a false drift alert is worse than no alert) and route the late
+        # submission to the GP as its own alert instead.
+        if freshness.freshness_status == FreshnessStatus.OVERDUE:
+            overdue_item = {
+                "company_id": cid, "company_name": name,
+                "priority_score": 20, "priority": "P2",
+                "red_alert_count": 0, "amber_alert_count": 1, "alert_count": 1,
+                "primary_risks": ["Data submission overdue"],
+                "headline": f"{name}: {freshness.message}",
+                "recommended_action": "Contact portco CFO — confirm data pack submission or escalate.",
+                "evidence": [{
+                    "metric": "reporting_schedule", "severity": "Amber",
+                    "summary": freshness.message, "source_path": None, "source_column": None,
+                }],
+                "alert_type": "DATA_SUBMISSION_OVERDUE",
+            }
+            action_items.append(overdue_item)
+            companies.append({
+                "company_id": cid, "company_name": name,
+                "health": "Amber", "status_counts": {},
+                "milestones_on_track": 0, "milestones_total": len(confirmed),
+                "headline_metrics": {}, "alert_count": 1,
+                "hitl_status": "monitoring", "priority": "P2", "priority_rank": None,
+                "headline": overdue_item["headline"],
+                "recommended_action": overdue_item["recommended_action"],
+                "primary_risks": overdue_item["primary_risks"],
+                "data_source": kpi_records[0].get("source_type", "unknown"),
+                "currency": kpi_records[0].get("currency", "GBP"),
+                "data_freshness": freshness.model_dump(),
             })
             continue
 
@@ -469,6 +445,7 @@ def get_portfolio_overview() -> Dict[str, Any]:
             company_id=cid,
             kpi_records_path=str(_kpi_records_path(cid)),
             vcp_store_path=DEFAULT_STORE_PATH,
+            milestones=confirmed,
         )
         counts = drift.get("status_counts", {})
 
@@ -483,25 +460,32 @@ def get_portfolio_overview() -> Dict[str, Any]:
                     "status": r.get("status"),
                 }
 
-        item = _action_item(cid, name, drift)
-        if item:
+        # HISTORICAL (structural cutoff, e.g. pre-take-private public data) is real,
+        # already-known drift, not an open operational risk — show the actual
+        # numbers (framed by the freshness badge) but don't raise a fresh GP alert
+        # asking someone to act on it.
+        is_historical = freshness.freshness_status == FreshnessStatus.HISTORICAL
+        item = build_action_item(cid, name, drift)
+        if item and not is_historical:
             action_items.append(item)
 
         companies.append({
             "company_id": cid, "company_name": name,
-            "health": _worst_status(counts), "status_counts": counts,
+            "health": _worst_status(counts),
+            "status_counts": counts,
             "milestones_on_track": counts.get("Green", 0),
             "milestones_total": sum(counts.values()),
             "headline_metrics": headline_metrics,
             "alert_count": sum(1 for r in drift.get("results", []) if r.get("status") in ("Red", "Amber")),
             "hitl_status": "monitoring",
-            "priority": item["priority"] if item else None,
+            "priority": item["priority"] if (item and not is_historical) else None,
             "priority_rank": None,
             "headline": item["headline"] if item else f"{name} is on track.",
             "recommended_action": item["recommended_action"] if item else None,
             "primary_risks": item["primary_risks"] if item else [],
             "data_source": kpi_records[0].get("source_type", "unknown") if kpi_records else None,
             "currency": kpi_records[0].get("currency", "GBP") if kpi_records else "GBP",
+            "data_freshness": freshness.model_dump(),
         })
 
     # Rank action items by score descending
@@ -553,30 +537,36 @@ def get_portfolio_overview() -> Dict[str, Any]:
 def get_company_detail(company_id: str) -> Dict[str, Any]:
     """Live company deep dive: VCP milestones with generated plan paths, drift, and KPI series."""
     store = VCPStore(DEFAULT_STORE_PATH)
-    milestones = [m.to_dict() for m in store.load_confirmed_for_company(company_id)]
+    confirmed_milestones = store.load_confirmed_for_company(company_id)
+    milestones = [m.to_dict() for m in confirmed_milestones]
     if not milestones:
         raise HTTPException(status_code=404, detail=f"No confirmed VCP for {company_id}. Complete Setup first.")
 
     name = milestones[0].get("company_name") or company_id
     kpi_records = _load_kpi(company_id)
+    deal = DealStore().load(company_id)
+    freshness = compute_freshness(company_id, kpi_records, deal.deal_close_date if deal else None)
 
     if not kpi_records:
         return {
             "company_id": company_id, "company_name": name,
             "sector": None, "currency": "GBP",
+            "data_source": None, "basis_mismatch": False, "last_filing_date": None,
             "health": "Not Evaluable", "status_counts": {},
             "latest_period_end": None,
             "milestones": milestones,
             "drift_results": [], "kpi_series": [],
+            "data_freshness": freshness.model_dump(),
         }
 
     kpi_periods = [r["period_end"] for r in kpi_records if r.get("period_end")]
-    milestones = _enrich_milestones(milestones, kpi_periods, company_id=company_id)
+    milestones = _enrich_milestones(milestones, kpi_periods, company_id=company_id, deal=deal)
 
     drift = run_vcp_drift_for_kpi_records(
         company_id=company_id,
         kpi_records_path=str(_kpi_records_path(company_id)),
         vcp_store_path=DEFAULT_STORE_PATH,
+        milestones=confirmed_milestones,
     )
 
     periods_per_year = infer_periods_per_year(kpi_records)
@@ -596,19 +586,35 @@ def get_company_detail(company_id: str) -> Dict[str, Any]:
         })
 
     first_rec = kpi_records[0]
+    data_source = first_rec.get("source_type", "unknown")
+    # Basis guard (company-level counterpart of the IRR engine's check): an EDGAR
+    # series with no adjusted EBITDA falls back to the GAAP operating-income proxy,
+    # which is not comparable to the VCP's non-GAAP targets — flag it so the UI can
+    # explain the gap instead of implying operational underperformance.
+    basis_mismatch = data_source == "edgar" and not any(
+        r.get("adjusted_ebitda") is not None for r in kpi_records
+    )
+    last_filing_date = max(kpi_periods) if data_source == "edgar" and kpi_periods else None
+    # Only OVERDUE (unreliable, late-arriving actuals) gates the drift/IRR display —
+    # HISTORICAL (e.g. Qualtrics pre-take-private) is real, finalized data and the
+    # deep dive should still show it, just framed by the freshness badge.
+    monitoring_paused = freshness.freshness_status == FreshnessStatus.OVERDUE
     return {
         "company_id": company_id, "company_name": name,
-        "sector": _infer_sector(company_id, name),
-        "data_source": first_rec.get("source_type", "unknown"),
+        "sector": _infer_sector(company_id, name, deal=deal),
+        "data_source": data_source,
+        "basis_mismatch": basis_mismatch,
+        "last_filing_date": last_filing_date,
         "cik": first_rec.get("cik") or None,
         "currency": first_rec.get("currency", "GBP"),
         "periods_per_year": periods_per_year,
-        "health": _worst_status(drift.get("status_counts", {})),
-        "status_counts": drift.get("status_counts", {}),
+        "health": "Not Evaluable" if monitoring_paused else _worst_status(drift.get("status_counts", {})),
+        "status_counts": {} if monitoring_paused else drift.get("status_counts", {}),
         "latest_period_end": drift.get("latest_period_end"),
         "milestones": milestones,
-        "drift_results": drift.get("results", []),
+        "drift_results": [] if monitoring_paused else drift.get("results", []),
         "kpi_series": series,
+        "data_freshness": freshness.model_dump(),
     }
 
 
@@ -658,7 +664,7 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
     store = VCPStore(DEFAULT_STORE_PATH)
     confirmed = store.load_confirmed_for_company(company_id)
     name = confirmed[0].company_name if confirmed else company_id
-    sector = _resolve_company_sector(company_id, name)
+    sector = _infer_sector(company_id, name)
     if sector:
         _register_sector(company_id, sector)
 
@@ -672,7 +678,10 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
 
 @router.get("/hitl")
 def get_hitl_queue() -> Dict[str, Any]:
-    return _load_json(HITL_QUEUE, default={"queue_item_count": 0, "pending_review_count": 0, "queue_items": []})
+    return load_hitl_queue(
+        str(HITL_QUEUE),
+        default={"queue_item_count": 0, "pending_review_count": 0, "queue_items": []},
+    )
 
 
 class DecisionRequest(BaseModel):
@@ -683,10 +692,51 @@ class DecisionRequest(BaseModel):
     edited_recommended_action: Optional[str] = None
 
 
+def _resume_graph_if_paused(company_id: Optional[str], req: DecisionRequest) -> None:
+    """Best-effort: if `company_id` has a monitoring-graph run paused at a HITL
+    interrupt (started via POST /api/vcp/graph/monitor/{company_id}), resume it
+    with this decision. A no-op for decisions on alerts that only ever went
+    through the synchronous /api/vcp/portfolio path, or when the Postgres
+    checkpointer isn't configured — this never blocks the flat-file decision
+    write above, which remains the source of truth for the HITL queue/audit log.
+    """
+    if not company_id:
+        return
+
+    from app.graph.checkpointer import is_configured
+
+    if not is_configured():
+        return
+
+    from langgraph.types import Command
+    from app.graph.vcp_monitoring_graph_builder import get_vcp_monitoring_graph
+
+    graph = get_vcp_monitoring_graph()
+    config = {"configurable": {"thread_id": company_id}}
+
+    try:
+        snapshot = graph.get_state(config)
+    except Exception:
+        return
+
+    if not snapshot or not snapshot.next:
+        return  # this thread isn't currently paused — nothing to resume
+
+    graph.invoke(
+        Command(resume={
+            "decision": req.decision,
+            "reviewed_by": req.reviewed_by,
+            "reviewer_note": req.reviewer_note,
+            "edited_recommended_action": req.edited_recommended_action,
+        }),
+        config=config,
+    )
+
+
 @router.post("/hitl/decision")
 def post_hitl_decision(req: DecisionRequest) -> Dict[str, Any]:
     try:
-        return apply_hitl_decision(
+        target = apply_hitl_decision(
             review_id=req.review_id, decision=req.decision,
             reviewed_by=req.reviewed_by, reviewer_note=req.reviewer_note,
             edited_recommended_action=req.edited_recommended_action,
@@ -697,12 +747,49 @@ def post_hitl_decision(req: DecisionRequest) -> Dict[str, Any]:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
+    _resume_graph_if_paused(target.get("company_id"), req)
+
+    return target
+
 
 @router.get("/audit-log")
 def get_audit_log() -> Dict[str, Any]:
-    if not HITL_AUDIT.exists():
-        return {"entries": [], "entry_count": 0}
-    return _load_json(HITL_AUDIT)
+    entries = load_audit_entries(str(HITL_AUDIT))
+    return {"entries": entries, "entry_count": len(entries)}
+
+
+# ── LangGraph monitoring run (strangler-fig alongside /portfolio, /company) ──
+# Same drift -> alert-synthesis -> HITL-routing logic as get_portfolio_overview/
+# get_company_detail above, but run through the compiled StateGraph so a Red/
+# Amber alert actually pauses (interrupt) on a durable Postgres checkpoint
+# instead of completing inline within this request.
+
+@router.post("/graph/monitor/{company_id}")
+def run_monitoring_graph(company_id: str) -> Dict[str, Any]:
+    from app.graph.vcp_monitoring_graph_builder import get_vcp_monitoring_graph
+
+    graph = get_vcp_monitoring_graph()
+    config = {"configurable": {"thread_id": company_id}}
+    result = graph.invoke({"company_id": company_id}, config=config)
+
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        return {
+            "company_id": company_id,
+            "thread_id": company_id,
+            "status": "interrupted",
+            "interrupt": interrupts[0].value,
+        }
+
+    return {
+        "company_id": company_id,
+        "thread_id": company_id,
+        "status": result.get("status"),
+        "alert_card": result.get("alert_card"),
+        "alert_severity": result.get("alert_severity"),
+        "hitl_status": result.get("hitl_status"),
+        "errors": result.get("errors", []),
+    }
 
 
 # ── Company onboarding (deal metadata + optional EDGAR pull) ─────────────────
@@ -740,7 +827,7 @@ def seed_company(req: SeedCompanyRequest) -> Dict[str, Any]:
     """
     from app.agents.kpi_extraction_agent import run_kpi_extraction_agent
     from app.schemas.kpi_schema import KPIExtractionConfig
-    from app.store.deal_store import DealMetadata
+    from app.store.deal_store import DealMetadata  # DealMetadata only; DealStore is top-level
 
     out: Dict[str, Any] = {
         "company_id": req.company_id,
@@ -774,9 +861,27 @@ def seed_company(req: SeedCompanyRequest) -> Dict[str, Any]:
     DealStore().save(deal)
     out["deal_metadata_saved"] = True
 
-    # 2. Register sector for instant lookup (also covered by DealStore, but belt-and-suspenders)
-    if req.sector_key:
-        _register_sector(req.company_id, req.sector_key)
+    # 2. Write company_meta sidecar — canonical sector store read by _infer_sector()
+    sic_code: Optional[str] = None
+    if req.cik:
+        try:
+            sic_code = fetch_company_sic(req.cik.strip())
+        except Exception:
+            sic_code = None  # sector still resolves via keyword fallback
+    resolved_sector = req.sector_key or infer_sector_key(
+        req.company_id, req.company_name, sic_code=sic_code
+    )
+    update_company_meta(
+        req.company_id,
+        base_dir=str(PROCESSED),
+        company_name=req.company_name,
+        sector_key=resolved_sector,
+        cik=req.cik,
+        sic=sic_code,
+        source_type="edgar" if req.cik else "private",
+    )
+    if resolved_sector:
+        _register_sector(req.company_id, resolved_sector)
 
     # 3. EDGAR ingestion — only when a CIK is provided
     if req.cik:
@@ -848,68 +953,6 @@ def run_extraction(company_id: str) -> Dict[str, Any]:
     }
 
 
-@router.post("/extract-upload")
-async def run_extraction_from_upload(
-    file: UploadFile = File(...),
-    company_id: Optional[str] = Form(None),
-    company_name: Optional[str] = Form(None),
-) -> Dict[str, Any]:
-    """VCP extraction from an uploaded IC memo (PDF/DOCX/MD)."""
-    from app.ingestion.document_loader import _DOCLING_SUFFIXES, _PASSTHROUGH_SUFFIXES, _PDF_SUFFIXES
-
-    filename = file.filename or "uploaded"
-    suffix = Path(filename).suffix.lower()
-    if suffix not in (_DOCLING_SUFFIXES | _PASSTHROUGH_SUFFIXES | _PDF_SUFFIXES):
-        raise HTTPException(status_code=400, detail=f"Unsupported file type '{suffix}'.")
-
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(raw) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File too large (max 25 MB).")
-
-    resolved_name = (company_name or "").strip() or _clean_name(Path(filename).stem)
-    resolved_id = (company_id or "").strip() or _slugify(resolved_name)
-
-    # Decide the company's sector once, here at ingestion, and store it with the company.
-    update_company_meta(
-        resolved_id,
-        base_dir=str(PROCESSED),
-        company_name=resolved_name,
-        sector_key=infer_sector_key(resolved_id, resolved_name),
-        source_type="ic_memo",
-    )
-
-    tmp_path: Optional[Path] = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(raw)
-            tmp_path = Path(tmp.name)
-        result = extract_from_document(str(tmp_path), resolved_id, resolved_name)
-    except (ValueError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    finally:
-        if tmp_path:
-            tmp_path.unlink(missing_ok=True)
-
-    result.source_document = filename
-    milestones = to_vcp_milestones(result)
-    if not milestones:
-        raise HTTPException(status_code=422, detail="No commitments extracted — document may be image-only.")
-
-    (PROCESSED / f"{resolved_id}_extracted_milestones.json").write_text(
-        json.dumps([m.to_dict() for m in milestones], indent=2, default=str), encoding="utf-8"
-    )
-    return {
-        "company_id": resolved_id, "company_name": resolved_name,
-        "extraction_mode": result.extraction_mode, "model": result.model,
-        "source_document": filename, "document_loader": result.document_loader,
-        "milestone_count": len(milestones),
-        "needs_review_count": sum(1 for m in milestones if m.confidence < 0.7),
-        "milestones": [m.to_dict() for m in milestones],
-    }
-
-
 class ConfirmRequest(BaseModel):
     company_name: Optional[str] = None
     reviewed_by: str
@@ -931,6 +974,120 @@ def confirm_extraction(company_id: str, req: ConfirmRequest) -> Dict[str, Any]:
         )
     except VCPConfirmationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── VCP extraction graph (Phase 3) ────────────────────────────────────────
+# True agentic Setup Graph: extract_milestones -> hitl_review (interrupts) ->
+# confirm_and_store, checkpointed via Postgres so the review pause survives
+# across the extract-upload / confirm HTTP requests instead of relying on two
+# stateless calls the way /extract-upload + /extract/{id}/confirm do today.
+
+@router.post("/graph/extract-upload")
+async def run_extraction_graph_from_upload(
+    file: UploadFile = File(...),
+    company_id: Optional[str] = Form(None),
+    company_name: Optional[str] = Form(None),
+) -> Dict[str, Any]:
+    """Start the extraction graph from an uploaded IC memo (PDF/DOCX/MD).
+
+    Runs extract_milestones synchronously, then pauses at hitl_review —
+    candidates come back in the response body (from the interrupt payload)
+    for the operating partner to edit before calling the /confirm endpoint.
+    """
+    from app.ingestion.document_loader import _DOCLING_SUFFIXES, _PASSTHROUGH_SUFFIXES, _PDF_SUFFIXES
+    from app.graph.extraction_graph import get_vcp_extraction_graph
+
+    filename = file.filename or "uploaded"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in (_DOCLING_SUFFIXES | _PASSTHROUGH_SUFFIXES | _PDF_SUFFIXES):
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{suffix}'.")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 25 MB).")
+
+    resolved_name = (company_name or "").strip() or _clean_name(Path(filename).stem)
+    resolved_id = (company_id or "").strip() or _slugify(resolved_name)
+
+    update_company_meta(
+        resolved_id,
+        base_dir=str(PROCESSED),
+        company_name=resolved_name,
+        sector_key=infer_sector_key(resolved_id, resolved_name),
+        source_type="ic_memo",
+    )
+
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(raw)
+            tmp_path = Path(tmp.name)
+
+        graph = get_vcp_extraction_graph()
+        config = {"configurable": {"thread_id": resolved_id}}
+        result = graph.invoke(
+            {
+                "company_id": resolved_id,
+                "company_name": resolved_name,
+                "tmp_path": str(tmp_path),
+                "source_filename": filename,
+            },
+            config=config,
+        )
+    finally:
+        if tmp_path:
+            tmp_path.unlink(missing_ok=True)
+
+    if result.get("status") == "extraction_empty":
+        raise HTTPException(status_code=422, detail="No commitments extracted — document may be image-only.")
+
+    interrupts = result.get("__interrupt__")
+    if not interrupts:
+        raise HTTPException(status_code=500, detail="Extraction graph did not pause for review as expected.")
+
+    payload = interrupts[0].value
+    return {
+        "thread_id": resolved_id,
+        "company_id": resolved_id,
+        "company_name": resolved_name,
+        "extraction_mode": result.get("extraction_mode"),
+        "model": result.get("model"),
+        "source_document": filename,
+        "document_loader": result.get("document_loader"),
+        "status": "pending_review",
+        "milestone_count": len(payload.get("candidate_milestones", [])),
+        "needs_review_count": payload.get("needs_review_count", 0),
+        "milestones": payload.get("candidate_milestones", []),
+    }
+
+
+@router.post("/graph/{thread_id}/confirm")
+def confirm_extraction_graph(thread_id: str, req: ConfirmRequest) -> Dict[str, Any]:
+    """Resume a paused extraction graph run with the operating partner's
+    reviewed (edited) milestone list, locking it into the VCPStore."""
+    from langgraph.types import Command
+    from app.graph.extraction_graph import get_vcp_extraction_graph
+
+    graph = get_vcp_extraction_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+
+    snapshot = graph.get_state(config)
+    if not snapshot or not snapshot.next:
+        raise HTTPException(status_code=404, detail=f"No pending extraction review for thread {thread_id}")
+
+    result = graph.invoke(
+        Command(resume={
+            "milestones": req.milestones,
+            "reviewed_by": req.reviewed_by,
+            "reviewer_note": req.reviewer_note,
+            "company_name": req.company_name,
+        }),
+        config=config,
+    )
+
+    return result.get("confirmation_result", {})
 
 
 @router.get("/store/{company_id}")
@@ -977,8 +1134,9 @@ def generate_memo() -> Dict[str, Any]:
             company_id=cid,
             kpi_records_path=str(_kpi_records_path(cid)),
             vcp_store_path=DEFAULT_STORE_PATH,
+            milestones=confirmed,
         )
-        item = _action_item(cid, name, drift)
+        item = build_action_item(cid, name, drift)
         if item:
             action_items.append(item)
 

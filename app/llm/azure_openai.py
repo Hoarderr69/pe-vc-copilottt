@@ -39,6 +39,9 @@ def get_client():
       - Classic:  https://<resource>.openai.azure.com  -> AzureOpenAI (api-version based)
       - v1 API:   https://<resource>.openai.azure.com/openai/v1 -> standard OpenAI client
         (the newer OpenAI-compatible surface; no api-version needed).
+
+    The client is wrapped with LangSmith's wrap_openai() so every call is traced
+    when LANGCHAIN_TRACING_V2/LANGSMITH_TRACING is set; it's a no-op otherwise.
     """
     missing = missing_vars()
     if missing:
@@ -52,15 +55,19 @@ def get_client():
     api_key = os.environ["AZURE_OPENAI_KEY"]
 
     # Imported lazily so the rest of the app runs without the SDK configured.
+    from langsmith.wrappers import wrap_openai
+
     if "/openai/v1" in endpoint:
         from openai import OpenAI
 
-        return OpenAI(base_url=endpoint.rstrip("/"), api_key=api_key)
+        return wrap_openai(OpenAI(base_url=endpoint.rstrip("/"), api_key=api_key))
 
     from openai import AzureOpenAI
 
-    return AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_API_VERSION),
+    return wrap_openai(
+        AzureOpenAI(
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_API_VERSION),
+        )
     )

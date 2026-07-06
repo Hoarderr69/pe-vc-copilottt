@@ -44,9 +44,12 @@ def _irr(entry_equity: float, exit_equity: float, years: float) -> Optional[floa
     return None if math.isnan(irr) or math.isinf(irr) else irr
 
 
-def _ensure_forecast(company_id: str, refresh: bool = False) -> pd.DataFrame:
+def _ensure_forecast(company_id: str, refresh: bool = False) -> tuple[pd.DataFrame, str]:
     """
-    Return the P10/P50/P90 EBITDA forecast for a company, caching to disk.
+    Return the P10/P50/P90 EBITDA forecast for a company, caching to disk, plus
+    the target column the forecast was fit on ("adjusted_ebitda" or the
+    GAAP-proxy fallback "ebitda_proxy") — callers need this to tell a genuine
+    EBITDA basis mismatch apart from ordinary forecast decay.
 
     The ensemble (SARIMA/Prophet) is stochastic and slow, so we run it once and
     reuse the cached CSV on subsequent calls — this keeps the IRR endpoint fast and
@@ -58,14 +61,14 @@ def _ensure_forecast(company_id: str, refresh: bool = False) -> pd.DataFrame:
             f"No model feature matrix for {company_id}: {feature_path}. "
             "Run the KPI ingestion pipeline first."
         )
-    forecast_path = FORECAST_DIR / f"{company_id}_quant_ebitda_forecast.csv"
-    if forecast_path.exists() and not refresh:
-        return pd.read_csv(forecast_path)
     # Forecast adjusted EBITDA when the source discloses it — that matches the
     # deal's entry-multiple basis. ebitda_proxy (GAAP operating income) is the
     # fallback for issuers without an adjusted figure.
     feature_cols = pd.read_csv(feature_path, nrows=0).columns
     target_col = "adjusted_ebitda" if "adjusted_ebitda" in feature_cols else "ebitda_proxy"
+    forecast_path = FORECAST_DIR / f"{company_id}_quant_ebitda_forecast.csv"
+    if forecast_path.exists() and not refresh:
+        return pd.read_csv(forecast_path), target_col
     config = ForecastConfig(
         feature_path=str(feature_path),
         target_col=target_col,
@@ -73,7 +76,7 @@ def _ensure_forecast(company_id: str, refresh: bool = False) -> pd.DataFrame:
         output_path=str(forecast_path),
         stl_output_path=str(FORECAST_DIR / f"{company_id}_stl_components.csv"),
     )
-    return run_quant_forecast(config)
+    return run_quant_forecast(config), target_col
 
 
 def _trailing_year_sum(kpi_records: List[Dict], fields: tuple[str, ...]) -> Optional[float]:
@@ -138,7 +141,7 @@ def build_vcp_irr(company_id: str, kpi_records: List[Dict]) -> Dict[str, Any]:
             f"{company_id}.json."
         )
 
-    forecast = _ensure_forecast(company_id)
+    forecast, forecast_target_col = _ensure_forecast(company_id)
     if len(forecast) < 4:
         raise ValueError("Need at least 4 forecast periods to derive terminal annual EBITDA.")
 
@@ -209,12 +212,15 @@ def build_vcp_irr(company_id: str, kpi_records: List[Dict]) -> Dict[str, Any]:
     )
 
     # Basis guard: the entry multiple was struck on the deal's entry EBITDA
-    # basis (often adjusted / non-GAAP). If that basis is positive but the
-    # forecastable EBITDA proxy is negative (e.g. GAAP operating income for an
-    # SBC-heavy issuer), applying entry multiple × forecast EBITDA is not a
-    # meaningful exit value — flag it instead of raising a distress alarm.
+    # basis (adjusted / non-GAAP). This is only a basis-comparability problem —
+    # not distress — when the forecast itself had to fall back to the GAAP
+    # operating-income proxy (no adjusted_ebitda disclosed). If the forecast
+    # was fit on adjusted_ebitda (the same basis as entry) and still decays to
+    # zero, that is real operating deterioration, not a basis artefact — it
+    # must flow through to the equity-at-risk alarm below, not be suppressed.
     basis_mismatch = (
-        deal.entry_ebitda is not None
+        forecast_target_col == "ebitda_proxy"
+        and deal.entry_ebitda is not None
         and deal.entry_ebitda > 0
         and exit_ebitda["base"] <= 0
     )

@@ -607,6 +607,8 @@ body { background: var(--bg-page); color: var(--text-primary); font-size: 14px; 
 .legend i.solid { border-top: 2px solid var(--chart-primary); }
 .legend i.dash  { border-top: 2px dashed var(--chart-peer); }
 .legend i.dot   { width: 8px; height: 8px; border-radius: 50%; background: var(--chart-primary); border: 1.5px solid var(--bg-surface); box-shadow: 0 0 0 1px var(--chart-primary); }
+.legend i.dash-primary { border-top: 2px dashed var(--chart-primary); }
+.legend i.band  { height: 10px; background: var(--chart-band); border: 1px solid var(--chart-primary); border-radius: 2px; opacity: 0.9; }
 .tip {
   background: var(--bg-surface); border: 1px solid var(--border-strong);
   border-radius: 6px; box-shadow: var(--shadow-raised); padding: 10px 12px; font-size: 12px;

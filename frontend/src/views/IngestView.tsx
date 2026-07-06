@@ -9,13 +9,15 @@ import { money, pct, shortDate } from "../lib/format";
 const BASE_CURRENCY = "USD";
 const ACCEPT = ".pdf,.docx,.pptx,.html,.xhtml,.md,.markdown,.txt,.csv,.xlsx,.xls";
 
-export function IngestView({ companies, onOpenCompany, onFinancialsIngested }: {
+export function IngestView({ companies, onOpenCompany, onFinancialsIngested, initialCompanyId }: {
   companies: CompanyOverview[];
   onOpenCompany?: (id: string) => void;
   onFinancialsIngested?: () => void;
+  /** Preselect a company (e.g. jumping here from a "Monitoring Paused" CTA on its detail page). */
+  initialCompanyId?: string;
 }) {
   const [status, setStatus] = useState<IngestStatus | null>(null);
-  const [activeId, setActiveId] = useState<string>("");
+  const [activeId, setActiveId] = useState<string>(initialCompanyId ?? "");
   const [result, setResult] = useState<IngestResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -157,7 +159,7 @@ export function IngestView({ companies, onOpenCompany, onFinancialsIngested }: {
               <span style={{ color: "var(--text-muted)", fontSize: 12 }}>Normalize to </span>
               <span className="mono" style={{ fontWeight: 600 }}>{BASE_CURRENCY}</span>
             </div>
-            <div style={{ fontSize: 13, color: "var(--text-muted)", fontSize: 12 }}>
+            <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
               Sector classification is derived from the ingested financial data for peer benchmarking.
             </div>
           </div>

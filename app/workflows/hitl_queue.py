@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from app.store.postgres_json_store import PostgresJsonStore
 
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    """Write JSON via a temp file + rename so concurrent readers never see a
-    truncated/empty file (multiple browser tabs can poll the same endpoint
-    and trigger overlapping refreshes of this file)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, indent=2, default=str))
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+# Shared with app.workflows.hitl_decisions — both modules key into the same
+# collection so the queue they read/write is the same underlying document.
+HITL_QUEUE_COLLECTION = "hitl_queue"
+
+_queue_store = PostgresJsonStore(HITL_QUEUE_COLLECTION)
+
+
+def load_hitl_queue(
+    queue_path: str = "data/processed/hitl_review_queue.json",
+    default: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Read the HITL review queue from Postgres — the same store that
+    refresh_hitl_review_queue_from_action_items and apply_hitl_decision write
+    to. Callers must read through here rather than the flat file directly, or
+    they'll see a stale snapshot from before the Postgres migration."""
+    queue = _queue_store.get(queue_path)
+    if queue is not None:
+        return queue
+    return default if default is not None else {"queue_items": []}
+
+
+def save_hitl_queue(queue: Dict[str, Any], queue_path: str = "data/processed/hitl_review_queue.json") -> None:
+    """Write the HITL review queue to Postgres. Companion to load_hitl_queue."""
+    _queue_store.put(queue_path, queue)
 
 
 def default_review_action(priority: str) -> str:
@@ -73,12 +83,10 @@ def refresh_hitl_review_queue_from_action_items(
     priority_rank, which shifts between runs. Keying by company avoids duplicating a
     company's item when its rank changes.
     """
-    path = Path(output_path)
     now = datetime.now(timezone.utc).isoformat()
 
-    existing_text = path.read_text(encoding="utf-8").strip() if path.exists() else ""
-    if existing_text:
-        queue = json.loads(existing_text)
+    queue = _queue_store.get(output_path)
+    if queue:
         items: List[Dict[str, Any]] = queue.get("queue_items", [])
     else:
         queue = {"created_at": now}
@@ -99,7 +107,7 @@ def refresh_hitl_review_queue_from_action_items(
     )
     queue["refreshed_at"] = now
 
-    _atomic_write_json(path, queue)
+    _queue_store.put(output_path, queue)
 
     return queue
 
@@ -139,8 +147,6 @@ def build_hitl_review_queue(
         "queue_items": queue_items,
     }
 
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    _queue_store.put(output_path, payload)
 
     return payload

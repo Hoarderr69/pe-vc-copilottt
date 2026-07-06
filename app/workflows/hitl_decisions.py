@@ -1,26 +1,13 @@
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.store.postgres_json_store import PostgresJsonStore
+from app.workflows.hitl_queue import HITL_QUEUE_COLLECTION
 
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    """Write JSON via a temp file + rename so concurrent readers never see a
-    truncated/empty file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, indent=2, default=str))
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
-
+_queue_store = PostgresJsonStore(HITL_QUEUE_COLLECTION)
+_audit_store = PostgresJsonStore("hitl_audit_log")
 
 # Allowed reviewer decisions and how each maps to the queue item status.
 DECISION_TO_STATUS = {
@@ -71,12 +58,11 @@ def apply_hitl_decision(
             "An 'edit' decision requires edited_recommended_action."
         )
 
-    path = Path(queue_path)
+    queue = _queue_store.get(queue_path)
 
-    if not path.exists():
+    if queue is None:
         raise FileNotFoundError(f"HITL review queue not found: {queue_path}")
 
-    queue = json.loads(path.read_text(encoding="utf-8"))
     items: List[Dict[str, Any]] = queue.get("queue_items", [])
 
     target = next(
@@ -108,7 +94,7 @@ def apply_hitl_decision(
     )
     queue["last_decision_at"] = reviewed_at
 
-    _atomic_write_json(path, queue)
+    _queue_store.put(queue_path, queue)
 
     audit_entry = {
         "logged_at": reviewed_at,
@@ -129,19 +115,25 @@ def apply_hitl_decision(
     return target
 
 
+def load_audit_entries(
+    audit_log_path: str = "data/processed/hitl_audit_log.json",
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Read entries from the audit log written by :func:`_append_audit_entry`."""
+    log = _audit_store.get(audit_log_path)
+    if not log:
+        return []
+    entries = log.get("entries", [])
+    return entries[:limit] if limit is not None else entries
+
+
 def _append_audit_entry(entry: Dict[str, Any], audit_log_path: str) -> None:
     """Append one decision entry to the append-only audit log."""
 
-    log_path = Path(audit_log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if log_path.exists() and log_path.read_text(encoding="utf-8").strip():
-        log = json.loads(log_path.read_text(encoding="utf-8"))
-    else:
-        log = {"entries": []}
+    log = _audit_store.get(audit_log_path) or {"entries": []}
 
     log["entries"].append(entry)
     log["entry_count"] = len(log["entries"])
     log["updated_at"] = entry["logged_at"]
 
-    _atomic_write_json(log_path, log)
+    _audit_store.put(audit_log_path, log)
