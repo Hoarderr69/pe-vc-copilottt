@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from app.adapters.registry import get_kpi_adapter
 from app.schemas.kpi_schema import KPIExtractionConfig
+from app.store.kpi_records_store import save_kpi_records
 
 
 def _write_json(path: str, payload: Any) -> None:
@@ -27,7 +28,7 @@ def run_kpi_extraction_agent(config: KPIExtractionConfig) -> Dict[str, Any]:
     adapter = get_kpi_adapter(config.source_type)
     result = adapter.extract(config)
 
-    _write_json(config.kpi_records_path, result["kpi_records"])
+    save_kpi_records(config.kpi_records_path, result["kpi_records"])
     _write_json(config.evidence_refs_path, result["evidence_refs"])
     _write_json(
         config.source_quality_report_path,

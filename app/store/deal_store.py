@@ -10,10 +10,10 @@ entry EV/leverage, holding period, and the IC-underwritten return targets. These
 come from the IC memo's "Sources & Uses" / "Transaction Structure" table, NOT from
 the VCP milestones (which are the value-creation *commitments* we monitor against).
 
-Field names are aligned with what :func:`app.quant.irr_engine.build_irr_scenarios`
-already consumes in ``pe_deal`` mode (``entry_equity_value``,
-``entry_enterprise_value``, ``holding_period_years``, ``ic_target_irr``,
-``ic_target_moic``) so the same metadata drives both engines.
+Field names are aligned with what :func:`app.quant.vcp_irr.build_vcp_irr`
+already consumes (``entry_equity_value``, ``entry_enterprise_value``,
+``holding_period_years``, ``ic_target_irr``, ``ic_target_moic``) so the same
+metadata drives both engines.
 """
 
 from __future__ import annotations

@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.ingestion.quarterly_resample import infer_periods_per_year
 from app.schemas.vcp_schema import VCPMilestone
+from app.store.kpi_records_store import load_kpi_records
 from app.store.vcp_store import VCPStore
 
 
@@ -349,13 +350,7 @@ def load_latest_kpi_snapshot_from_records(kpi_records_path: str) -> Dict[str, An
     while drift consumes only normalized KPI records.
     """
 
-    path = Path(kpi_records_path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"KPI records file not found: {kpi_records_path}")
-
-    with open(path, "r", encoding="utf-8") as f:
-        records = json.load(f)
+    records = load_kpi_records(kpi_records_path)
 
     if not records:
         raise ValueError(f"No KPI records found in: {kpi_records_path}")

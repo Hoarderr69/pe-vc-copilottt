@@ -38,8 +38,10 @@ uv run python scripts/run_all_private_portco_kpi_normalization.py
 uv run python scripts/run_portfolio_vcp_monitoring.py
 uv run python scripts/run_portfolio_action_inbox.py
 uv run python scripts/run_hitl_queue_builder.py
-uv run python scripts/run_portfolio_memo.py
 ```
+
+The portfolio memo is no longer built by a standalone script — it's generated live via
+`POST /api/vcp/memo/generate` and read back via `GET /api/vcp/memo`.
 
 ## VCP Extraction Agent (first LLM agent)
 

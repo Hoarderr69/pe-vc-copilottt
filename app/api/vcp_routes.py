@@ -33,6 +33,8 @@ from app.llm import azure_openai
 from app.quant.vcp_irr import build_vcp_irr
 from app.store.company_store import load_company_meta, update_company_meta
 from app.store.deal_store import DealStore
+from app.store.kpi_records_store import load_kpi_records
+from app.store.portfolio_memo_store import load_portfolio_memo, save_portfolio_memo
 from app.store.vcp_store import VCPStore
 from app.workflows.hitl_decisions import HITLDecisionError, apply_hitl_decision, load_audit_entries
 from app.workflows.hitl_queue import (
@@ -52,7 +54,6 @@ PROCESSED = PROJECT_ROOT / "data" / "processed"
 IC_MEMO_DIR = PROJECT_ROOT / "data" / "raw" / "ic_memos"
 HITL_QUEUE = PROCESSED / "hitl_review_queue.json"
 HITL_AUDIT = PROCESSED / "hitl_audit_log.json"
-PORTFOLIO_MEMO = PROCESSED / "portfolio_memo.md"
 
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
@@ -72,10 +73,7 @@ def _kpi_records_path(company_id: str) -> Path:
 
 
 def _load_kpi(company_id: str) -> List[Dict]:
-    path = _kpi_records_path(company_id)
-    if not path.exists():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
+    return load_kpi_records(str(_kpi_records_path(company_id)))
 
 
 def _load_json(path: Path, default: Any = None) -> Any:
@@ -657,7 +655,7 @@ def get_peer_benchmark(company_id: str) -> Dict[str, Any]:
     from app.analytics.peer_benchmarking import run_peer_benchmark_for_company
 
     kpi_path = _kpi_records_path(company_id)
-    if not kpi_path.exists():
+    if not _load_kpi(company_id):
         raise HTTPException(status_code=404, detail=f"No KPI records for {company_id}")
 
     # Auto-register sector mapping if not already present
@@ -1106,9 +1104,10 @@ def get_confirmed_vcp(company_id: str) -> Dict[str, Any]:
 
 @router.get("/memo")
 def get_memo() -> Dict[str, Any]:
-    if not PORTFOLIO_MEMO.exists():
+    markdown = load_portfolio_memo()
+    if markdown is None:
         raise HTTPException(status_code=404, detail="Portfolio memo not generated yet.")
-    return {"markdown": PORTFOLIO_MEMO.read_text(encoding="utf-8")}
+    return {"markdown": markdown}
 
 
 @router.post("/memo/generate")
@@ -1202,7 +1201,6 @@ def generate_memo() -> Dict[str, Any]:
         lines.append("")
 
     memo_text = "\n".join(lines)
-    PORTFOLIO_MEMO.parent.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_MEMO.write_text(memo_text, encoding="utf-8")
+    save_portfolio_memo(memo_text)
 
     return {"markdown": memo_text, "generated_at": generated_at, "action_item_count": len(action_items)}

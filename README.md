@@ -4,9 +4,8 @@ Tracks a private equity portfolio company's investment thesis (Value Creation Pl
 against live financial data, detects drift early, and generates board-ready reports
 — with a human review gate before anything reaches an operating partner or a board.
 
-> Full architecture, data flow diagrams, and the current Azure/LangSmith migration
-> plan live in [Architecture.md](Architecture.md). This file is the quickstart +
-> orientation.
+> Full architecture, data flow diagrams, and the complete API reference live in
+> [Architecture.md](Architecture.md). This file is the quickstart + orientation.
 
 ## What it is
 
@@ -31,16 +30,19 @@ started. This app:
 |---|---|
 | Frontend | React 19 + TypeScript, Vite, Recharts |
 | Backend | FastAPI (Python 3.13), Pydantic |
+| Orchestration | LangGraph (3 graphs: VCP extraction, VCP monitoring, report generation), checkpointed on Postgres |
 | Quant / forecasting | pandas, statsmodels, Prophet, scikit-learn |
-| LLM | Azure OpenAI (structured extraction/narrative), with a fully-functional offline heuristic fallback when no LLM is configured |
+| LLM | Azure OpenAI (structured extraction/narrative), with a fully-functional offline heuristic fallback when no LLM is configured; traced via LangSmith when configured |
 | Document parsing | PyMuPDF4LLM (fast path), Docling (OCR fallback for scanned PDFs) |
 | Report generation | python-pptx + matplotlib (editable deck), reportlab (PDF), LibreOffice headless (PPTX→PDF) |
 | External data | SEC EDGAR XBRL, FRED (macro), Yahoo Finance (exit multiples) |
-| Storage | Flat JSON files under `data/` today — Azure DB migration in progress, see [Architecture.md §12](Architecture.md#12-planned-azure-services-migration--langsmith-in-progress) |
+| Storage | Azure Database for PostgreSQL — one JSONB table (`app_documents`) holds every document store (VCP milestones, deal/company metadata, reports, HITL queue/audit log, KPI records, portfolio memo) plus the LangGraph checkpoint tables. Feature-matrix CSVs and uploaded source documents stay on local disk. See [Architecture.md §12](Architecture.md#12-langgraph--postgres-migration-live-2026-07-06) |
 
 ## Quickstart
 
-Two processes, run from the repo root in separate terminals.
+Two processes, run from the repo root in separate terminals. Requires a
+`DATABASE_URL` in `.env` (Postgres) — the app has no local-file fallback for its
+document stores.
 
 **Backend** (FastAPI, port 8000):
 ```bash
@@ -54,7 +56,7 @@ npm install   # first time only
 npm run dev
 ```
 
-Open http://localhost:5173. The backend needs no credentials to run — every LLM
+Open http://localhost:5173. No LLM credentials are required to run — every LLM
 agent falls back to a deterministic offline heuristic when Azure OpenAI isn't
 configured (see below).
 
@@ -67,18 +69,22 @@ configured (see below).
 .venv/bin/python scripts/run_portfolio_action_inbox.py
 .venv/bin/python scripts/run_hitl_queue_builder.py
 ```
-These write into `data/processed/` and `data/features/`, which the live API reads
-directly — there's no separate database to seed.
+These write KPI records, milestones, and the HITL queue into Postgres (via the
+same stores the live API reads) plus feature-matrix CSVs under `data/features/`.
+The portfolio memo is no longer a batch script — generate it live via
+`POST /api/vcp/memo/generate` (the Portfolio Memo view's "Regenerate" button).
 
 ## Environment variables
 
-None are required to run the app. Set these in a repo-root `.env` to enable the
-corresponding feature:
+LLM credentials are optional (see below); `DATABASE_URL` is required. Set these in
+a repo-root `.env`:
 
 | Variable | Enables |
 |---|---|
+| `DATABASE_URL` | **Required.** Postgres connection string — backs every document store and the LangGraph checkpointer |
 | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY` | Live LLM extraction/narrative (else: offline heuristics) |
 | `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION` | Override defaults (`gpt-4o`, `2024-10-21`) |
+| `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` | LangSmith tracing of every LLM call (off by default) |
 | `FRED_API_KEY` | Macro regressors in the quant forecast |
 | `SEC_USER_AGENT` | Respectful identification to SEC EDGAR (has a default, override for production) |
 | `CORS_ORIGINS` | Comma-separated allowed origins (defaults to local Vite ports) |
@@ -98,40 +104,33 @@ app/
   ingestion/    Document loading, currency normalization, feature-matrix assembly
   quant/        Forecast ensemble + IRR scenario engine
   reports/      Slide-data builder, PPTX/PDF generators
-  store/        JSON-file persistence (VCP milestones, deal/company metadata, reports)
-  workflows/    HITL queue + decision/audit log
+  store/        Postgres-backed document stores (VCP milestones, deal/company
+                metadata, reports, KPI records, portfolio memo) via PostgresJsonStore
+  workflows/    HITL queue + decision/audit log, VCP confirmation (all Postgres-backed)
   schemas/      Shared data models
-  llm/          Azure OpenAI client wrapper
-  graph/        Legacy, orphaned LangGraph pipeline — see Architecture.md §11
+  llm/          Azure OpenAI client wrapper (LangSmith-traced when configured)
+  graph/        3 live LangGraph workflows (VCP extraction, VCP monitoring, report
+                generation) + the Postgres checkpointer
 frontend/src/
   views/        One component per screen (Portfolio, CompanyDetail, Setup, Ingest, ...)
   components/   Shared UI, charts, board-pack slide renderers
   lib/          api.ts (fetch client) + format.ts
-data/           Flat-file JSON/CSV store (see Architecture.md §6 for the full map)
-scripts/        Standalone CLI scripts — demo data generation, legacy batch pipeline
+data/           Feature-matrix CSVs and uploaded source documents only — everything
+                else lives in Postgres (see Architecture.md §12)
+scripts/        Standalone CLI scripts — demo data generation, batch pipeline exports
 ```
 
 ## Current limitations
 
-- **No database** — everything is JSON/CSV on local disk. Fine for a single-user
-  internal tool, not for concurrent writers or multi-instance deployment. This is
-  the subject of the in-progress Azure migration.
 - **No auth** — anyone who can reach the API can read/write any company's data.
-- **Report generation is synchronous** — a board pack generation request blocks
-  until the full pipeline (drift → LLM narrative → slide build) completes.
-- **Single-instance only** — no locking around the JSON stores; concurrent writes
-  to the same company are not safe.
-
-## In progress (today)
-
-Migrating file-based storage to Azure services and wiring up LangSmith tracing for
-the LLM agents. `langsmith`/`langchain`/`langchain-openai` are already project
-dependencies but currently unused — see
-[Architecture.md §12](Architecture.md#12-planned-azure-services-migration--langsmith-in-progress)
-for the concrete target design and the fastest integration path for each.
+- **Uploaded source documents and feature-matrix CSVs are still local disk** — fine
+  for a single-instance deployment, not yet migrated to blob storage.
+- Report generation runs as a background task (checkpointed, polled via
+  `GET /api/reports/graph/{thread_id}/status`) — not fully synchronous, but still a
+  single in-process task queue, not a real job runner.
 
 ## More docs
 
-- [Architecture.md](Architecture.md) — full system architecture, data flow diagrams, API reference, known legacy/orphaned code, planned Azure/LangSmith migration
+- [Architecture.md](Architecture.md) — full system architecture, data flow diagrams, API reference, the Postgres/LangGraph migration, and known remaining debt
 - [HOW_TO_RUN_DEMO.md](HOW_TO_RUN_DEMO.md) — guided demo walkthrough
 - [README_SYNTHETIC_DATA.md](README_SYNTHETIC_DATA.md) — synthetic portfolio company data generator

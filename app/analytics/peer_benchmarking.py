@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from app.ingestion.quarterly_resample import infer_periods_per_year
+from app.store.kpi_records_store import load_kpi_records
 
 DEFAULT_BENCHMARKS = "data/reference/sector_benchmarks.json"
 
@@ -251,10 +252,7 @@ def run_peer_benchmark_for_company(
     benchmarks = _load_benchmarks(benchmarks_path)
     directions = benchmarks.get("_metric_direction") or _DEFAULT_METRIC_DIRECTION
 
-    path = Path(kpi_records_path)
-    if not path.exists():
-        raise FileNotFoundError(f"KPI records not found: {kpi_records_path}")
-    records = json.loads(path.read_text(encoding="utf-8"))
+    records = load_kpi_records(kpi_records_path)
     if not records:
         return _not_evaluable_payload(
             company_id, company_id, None, None, directions,

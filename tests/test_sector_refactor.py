@@ -24,6 +24,7 @@ from app.store.company_store import (  # noqa: E402
     load_company_meta,
     update_company_meta,
 )
+from app.store.kpi_records_store import save_kpi_records  # noqa: E402
 
 
 # ── Fixtures / builders ──────────────────────────────────────────────────────
@@ -58,7 +59,12 @@ def _write_benchmarks(path: Path) -> None:
 
 
 def _write_kpi_records(path: Path, company_id: str, company_name: str) -> None:
-    """14 monthly records so YoY growth (needs >=13) and all margins are evaluable."""
+    """14 monthly records so YoY growth (needs >=13) and all margins are evaluable.
+
+    KPI records are Postgres-backed (app.store.kpi_records_store); ``path`` is
+    just the identity key run_peer_benchmark_for_company reads back through,
+    not a file on disk.
+    """
     records = []
     for i in range(14):
         revenue = 1000.0 * (1.0 + 0.02 * i)  # grows ~ month over month
@@ -74,7 +80,7 @@ def _write_kpi_records(path: Path, company_id: str, company_name: str) -> None:
                 "net_debt": revenue * 5.0,
             }
         )
-    path.write_text(json.dumps(records), encoding="utf-8")
+    save_kpi_records(str(path), records)
 
 
 # ── Step 1.1: resolver ───────────────────────────────────────────────────────

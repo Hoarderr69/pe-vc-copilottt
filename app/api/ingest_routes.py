@@ -32,6 +32,7 @@ from app.analytics.sector import infer_sector_key
 from app.llm import azure_openai
 from app.schemas.kpi_schema import KPIExtractionConfig
 from app.store.company_store import update_company_meta
+from app.store.kpi_records_store import load_kpi_records
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED = PROJECT_ROOT / "data" / "processed"
@@ -179,10 +180,8 @@ async def ingest_financials_upload(
         )
 
     # Read back the records we just wrote for the period preview (kept out of the
-    # adapter return to stay light; the file is the source of truth either way).
-    import json
-
-    records = json.loads(Path(config.kpi_records_path).read_text(encoding="utf-8"))
+    # adapter return to stay light; the store is the source of truth either way).
+    records = load_kpi_records(config.kpi_records_path)
 
     # Report the currency the records actually carry. The document path normalizes to the
     # requested base (USD); the tabular path passes a source currency column through

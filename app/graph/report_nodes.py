@@ -50,10 +50,12 @@ def load_milestones_and_kpis_node(state: ReportGenerationState) -> ReportGenerat
     milestones = [m.to_dict() for m in confirmed_milestones]
     company_name = confirmed_milestones[0].company_name or company_id
 
+    from app.store.kpi_records_store import load_kpi_records
+
     kpi_path = PROCESSED / f"{company_id}_kpi_records.json"
-    if not kpi_path.exists():
+    kpi_records_raw = load_kpi_records(str(kpi_path))
+    if not kpi_records_raw:
         raise ValueError(f"No KPI records for {company_id}")
-    kpi_records_raw = json.loads(kpi_path.read_text(encoding="utf-8"))
 
     kpi_series = []
     for r in kpi_records_raw:
