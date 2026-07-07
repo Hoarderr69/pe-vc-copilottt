@@ -140,3 +140,7 @@ scripts/        Standalone CLI scripts — demo data generation, batch pipeline 
 LANGSMITH_ENDPOINT=https://apac.api.smith.langchain.com
 LANGSMITH_A PI_K EY=lsv 2_pt_388806e0bcbb43e88b41ff32979ba5 2b_d97f5bebb8
 LANGSMITH_PROJECT=demo_pevc -->
+<!-- 
+
+python scripts/seed_public_to_private_company.py --company-id qualtrics --company-name "Qualtrics International Inc." --cik 1747748 --ticker XM --deal-metadata-json data/raw/deal_metadata/qualtrics.json --milestones-json data/raw/vcp_milestones/qualtrics_milestones.json --reviewed-by "your-name" 
+-->
