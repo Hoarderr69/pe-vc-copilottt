@@ -12,4 +12,5 @@ node_modules/
 .claude/
 data/processed/
 data/features/
-data/reference/
+data/reference/*
+!data/reference/sector_benchmarks.json

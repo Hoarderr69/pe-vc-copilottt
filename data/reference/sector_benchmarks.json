@@ -1,0 +1,51 @@
+{
+  "_about": "Sector benchmark medians used by the Peer Benchmarking Node. Values are representative mid-market medians (Damodaran-style industry aggregates) for the prototype. In production this is replaced by a live EDGAR SIC-code peer pull (20-50 peers -> computed medians).",
+  "_metric_direction": {
+    "revenue_growth_yoy": "higher_is_better",
+    "ebitda_margin": "higher_is_better",
+    "gross_margin": "higher_is_better",
+    "net_debt_to_ebitda": "lower_is_better"
+  },
+  "sectors": {
+    "b2b_saas": {
+      "label": "B2B SaaS",
+      "peer_set_size": 32,
+      "medians": {
+        "revenue_growth_yoy": 0.18,
+        "ebitda_margin": 0.22,
+        "gross_margin": 0.74,
+        "net_debt_to_ebitda": 1.5
+      }
+    },
+    "industrial_manufacturing": {
+      "label": "Industrial Manufacturing",
+      "peer_set_size": 41,
+      "medians": {
+        "revenue_growth_yoy": 0.05,
+        "ebitda_margin": 0.14,
+        "gross_margin": 0.3,
+        "net_debt_to_ebitda": 2.6
+      }
+    },
+    "healthcare_services": {
+      "label": "Healthcare Services",
+      "peer_set_size": 28,
+      "medians": {
+        "revenue_growth_yoy": 0.1,
+        "ebitda_margin": 0.16,
+        "gross_margin": 0.42,
+        "net_debt_to_ebitda": 3.0
+      }
+    }
+  },
+  "company_sector_map": {
+    "portco_a_saas": "b2b_saas",
+    "portco_b_industrial": "industrial_manufacturing",
+    "portco_c_healthcare": "healthcare_services",
+    "new_company": "b2b_saas",
+    "portco_b_industrial_ic_memo": "industrial_manufacturing",
+    "portco_c_healthcare_ic_memo": "healthcare_services",
+    "qualtrics": "b2b_saas",
+    "sic_test_crm": "b2b_saas"
+  }
+}
