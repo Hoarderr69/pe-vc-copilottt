@@ -134,3 +134,9 @@ scripts/        Standalone CLI scripts — demo data generation, batch pipeline 
 - [Architecture.md](Architecture.md) — full system architecture, data flow diagrams, API reference, the Postgres/LangGraph migration, and known remaining debt
 - [HOW_TO_RUN_DEMO.md](HOW_TO_RUN_DEMO.md) — guided demo walkthrough
 - [README_SYNTHETIC_DATA.md](README_SYNTHETIC_DATA.md) — synthetic portfolio company data generator
+
+
+<!-- LANGSMITH_TRACING=true
+LANGSMITH_ENDPOINT=https://apac.api.smith.langchain.com
+LANGSMITH_A PI_K EY=lsv 2_pt_388806e0bcbb43e88b41ff32979ba5 2b_d97f5bebb8
+LANGSMITH_PROJECT=demo_pevc -->
