@@ -78,9 +78,16 @@ def _ocr_converter():
     This is the heavy path: it loads an OCR engine and the TableFormer model. We build
     it once (lru_cache) and only ever invoke it on pages that lack a text layer.
     """
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    try:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "This document has scanned (image) pages that need OCR, but docling "
+            "isn't installed in this deployment. Upload a native-text PDF instead, "
+            "or add docling back to pyproject.toml and rebuild the image."
+        ) from e
 
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
